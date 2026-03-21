@@ -1,82 +1,107 @@
+import argparse
+import socket
 import win32pipe
 import win32file
 import pywintypes
-import socket
-import threading
-import sys
+import time
+import logging
+from logging.handlers import RotatingFileHandler
 
-PIPE_NAME = r'\\.\pipe\carma'
-LINUX_HOST = '127.0.0.1'
-LINUX_PORT = 18080
+# Настройка логирования для моста
+logger = logging.getLogger("WineBridge")
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+
+file_handler = RotatingFileHandler('wine_bridge.log', maxBytes=2 * 1024 * 1024, backupCount=2, encoding='utf-8')
+file_handler.setFormatter(formatter)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 
-def tcp_to_pipe(sock, pipe):
-    """Читает из TCP и пишет в Pipe"""
-    while True:
-        try:
-            data = sock.recv(4096)
-            if not data:
-                break
-            win32file.WriteFile(pipe, data)
-        except Exception:
-            break
-
-
-def handle_client(pipe):
-    print("Клиент подключился к pipe.")
+def handle_client(pipe, proxy_host: str, proxy_port: int):
     try:
-        # Подключаемся к нативному Linux-серверу
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((LINUX_HOST, LINUX_PORT))
-        print(f"Соединение с Linux-сервером {LINUX_HOST}:{LINUX_PORT} установлено.")
+        logger.info("Подключился клиент к Pipe. Чтение данных...")
+        hr, data = win32file.ReadFile(pipe, 10 * 1024 * 1024)
 
-        # Запускаем поток для чтения ответов от Linux
-        t = threading.Thread(target=tcp_to_pipe, args=(sock, pipe), daemon=True)
-        t.start()
+        if not data:
+            logger.warning("Прочитаны пустые данные из Pipe")
+            return
 
-        # Читаем запросы из Pipe и шлем в Linux
-        while True:
-            try:
-                hr, data = win32file.ReadFile(pipe, 4096)
-                if not data:
+        logger.info(f"Получено {len(data)} байт. Пересылаем на TCP прокси {proxy_host}:{proxy_port}...")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(30.0)  # Таймаут ожидания ответа от линукса (важно!)
+            s.connect((proxy_host, proxy_port))
+            s.sendall(data)
+
+            response_data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
                     break
-                sock.sendall(data)
-            except pywintypes.error as e:
-                # Ошибка 109 - pipe был закрыт на другом конце
-                if e.winerror != 109:
-                    print(f"Ошибка чтения pipe: {e}")
-                break
-    except Exception as e:
-        print(f"Ошибка: {e}")
-    finally:
-        sock.close()
+                response_data += chunk
+
+        logger.info(f"Получен ответ от Linux прокси ({len(response_data)} байт). Запись обратно в Pipe...")
+        win32file.WriteFile(pipe, response_data)
         win32file.FlushFileBuffers(pipe)
-        win32pipe.DisconnectNamedPipe(pipe)
-        win32file.CloseHandle(pipe)
-        print("Клиент отключен.")
+        logger.info("Цикл обмена успешно завершен.")
+
+    except socket.timeout:
+        logger.error("Таймаут: Linux-прокси не ответил вовремя.")
+    except socket.error as e:
+        logger.error(f"Ошибка сети (нет связи с Linux-прокси): {e}")
+    except Exception as e:
+        logger.exception("Непредвиденная ошибка при обработке клиента Pipe")
+    finally:
+        try:
+            win32pipe.DisconnectNamedPipe(pipe)
+            win32file.CloseHandle(pipe)
+        except Exception as e:
+            logger.debug(f"Ошибка при закрытии Pipe (можно игнорировать): {e}")
 
 
 def main():
-    print(f"Ожидание подключений на {PIPE_NAME}...")
+    parser = argparse.ArgumentParser(description="Wine Bridge (Named Pipe -> TCP Proxy)")
+    parser.add_argument('--proxy-host', type=str, default='127.0.0.1', help='IP адрес Linux-прокси')
+    parser.add_argument('--proxy-port', type=int, default=18081, help='Порт Linux-прокси')
+    parser.add_argument('--pipe', type=str, default=r'\\.\pipe\carma', help='Имя Named Pipe')
+
+    args = parser.parse_args()
+
+    logger.info("Запуск Wine Bridge...")
+    logger.info(f"Слушаем Pipe: {args.pipe}")
+    logger.info(f"Перенаправляем на TCP: {args.proxy_host}:{args.proxy_port}")
+
     while True:
-        pipe = win32pipe.CreateNamedPipe(
-            PIPE_NAME,
-            win32pipe.PIPE_ACCESS_DUPLEX,
-            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-            win32pipe.PIPE_UNLIMITED_INSTANCES,
-            65536, 65536,
-            0,
-            None
-        )
+        try:
+            pipe = win32pipe.CreateNamedPipe(
+                args.pipe,
+                win32pipe.PIPE_ACCESS_DUPLEX,
+                win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
+                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                10 * 1024 * 1024,
+                10 * 1024 * 1024,
+                0,
+                None
+            )
 
-        if pipe == win32file.INVALID_HANDLE_VALUE:
-            print("Ошибка создания Named Pipe")
-            sys.exit(1)
+            win32pipe.ConnectNamedPipe(pipe, None)
+            handle_client(pipe, args.proxy_host, args.proxy_port)
 
-        win32pipe.ConnectNamedPipe(pipe, None)
-        # Обрабатываем клиента в отдельном потоке, чтобы не блокировать pipe
-        client_thread = threading.Thread(target=handle_client, args=(pipe,), daemon=True)
-        client_thread.start()
+        except pywintypes.error as e:
+            logger.error(f"Ошибка Windows API: {e}")
+            time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Остановка моста...")
+            break
+        except Exception as e:
+            logger.exception("Критическая ошибка в главном цикле")
+            time.sleep(1)
 
 
 if __name__ == '__main__':
