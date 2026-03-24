@@ -8,79 +8,78 @@ import logging
 import json
 import re
 import base64
+import copy
 from datetime import datetime
 
 # --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG, # Включен максимальный уровень подробности
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler('wine_bridge.log', encoding='utf-8'),
+        logging.FileHandler('wine_bridge_debug.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
+# --- ХЕЛПЕРЫ ДЛЯ ЛОГОВ ---
+def format_json_for_log(raw_bytes: bytes) -> str:
+    """Пытается распарсить JSON и красиво его вывести, обрезая длинные base64 строки."""
+    try:
+        data_dict = json.loads(raw_bytes.decode('utf-8'))
+        dump_dict = copy.deepcopy(data_dict)
+        # Идем по ключам и обрезаем гигантские строки (например, fileData)
+        for k, v in dump_dict.items():
+            if isinstance(v, str) and len(v) > 200:
+                dump_dict[k] = v[:50] + f"... [Строка обрезана, {len(v)} символов]"
+        return json.dumps(dump_dict, ensure_ascii=False, indent=2)
+    except Exception:
+        # Если это не JSON, возвращаем кусок сырых данных
+        snippet = raw_bytes[:500]
+        return snippet.decode('utf-8', errors='replace') + ("..." if len(raw_bytes) > 500 else "")
+
 # --- ГЕНЕРАЦИЯ ЗАГЛУШКИ ДЛЯ ПРОГРАММЫ ---
 def generate_eid_stub() -> str:
-    """Генерирует строку EID в формате UTF-16LE + Base64."""
     now = datetime.now()
     time_str = now.strftime("%d.%m.%Y %H:%M:%S")
-    
     eid_raw = (
         f'version="V1";UtcTime="{time_str}";LocalTime="{time_str}";'
         f'GenTime="{time_str}";SerialNumber="001234567890";Policy="1.2.643.2.2.34.6";'
         f'HashAlg="ГОСТ Р 34.11-2012 256 бит";HashValue="IMITATION_HASH_VALUE";'
         f'Accuracy="";Ordering="Выкл.";Nonce="";Tsa="";'
     )
-    
     eid_utf16 = eid_raw.encode('utf-16le')
     return base64.b64encode(eid_utf16).decode('utf-8')
 
 # --- ТРАНСЛЯЦИЯ ЗАПРОСОВ И ОТВЕТОВ ---
 def translate_request(req_body: bytes) -> bytes:
-    """Подменяет режимы 53 и 55, доверяя настройки TSP самой Карме."""
     try:
         payload = json.loads(req_body.decode('utf-8'))
         mode = payload.get("mode")
         
         if mode == 53:
-            logging.info("Перехват: mode 53 -> mode 27 (Создание подписи).")
             payload["mode"] = 27 
-            
             tsp_params = "TSP_CHECK_CERT=0;"
             if "TSP_URL" in payload and payload["TSP_URL"]:
-                logging.info(f"Программа явно запросила TSP_URL: {payload['TSP_URL']}")
                 tsp_params += f"TSP_URL={payload['TSP_URL']};"
-            else:
-                logging.info("TSP_URL не передан, Карма использует свои настройки по умолчанию.")
             
             ext = payload.get("extInitParams", "")
-            if ext and not ext.endswith(';'): 
-                ext += ';'
+            if ext and not ext.endswith(';'): ext += ';'
             payload["extInitParams"] = ext + tsp_params
                 
         elif mode == 55:
-            logging.info("Перехват: mode 55 -> mode 29 (Проверка подписи).")
             payload["mode"] = 29
             
         return json.dumps(payload, separators=(',', ':')).encode('utf-8')
-        
-    except json.JSONDecodeError:
-        return req_body
-    except Exception as e:
-        logging.error(f"Ошибка при трансляции запроса: {e}")
+    except:
         return req_body
 
 def translate_response(resp_body: bytes, original_mode: int) -> bytes:
-    """Добавляет имитацию структур штампа времени в ответ Кармы для Windows-программы."""
     if original_mode not in (53, 55):
         return resp_body
         
     try:
         payload = json.loads(resp_body.decode('utf-8'))
-        
         if "signInfo" in payload and isinstance(payload["signInfo"], list):
-            logging.info(f"Модификация ответа для mode {original_mode}: инъекция блока Extensions.")
             for info in payload["signInfo"]:
                 info["Extensions"] = [{
                     "ExtensionName": "Штамп времени",
@@ -91,18 +90,14 @@ def translate_response(resp_body: bytes, original_mode: int) -> bytes:
                 info["CoSigners"] = []
                 
         return json.dumps(payload, separators=(',', ':')).encode('utf-8')
-        
-    except json.JSONDecodeError:
-        return resp_body
-    except Exception as e:
-        logging.error(f"Ошибка при трансляции ответа: {e}")
+    except:
         return resp_body
 
 # --- РАБОТА С HTTP И СЕТЬЮ ---
 def process_http_message(data: bytes, is_request: bool = True, original_mode: int = 0) -> tuple[bytes, int]:
-    """Разбирает HTTP, модифицирует JSON и пересобирает с новым Content-Length."""
     header_end = data.find(b'\r\n\r\n')
     if header_end == -1:
+        logging.warning("Получены данные без HTTP-заголовков!")
         return data, 0 
 
     headers_raw = data[:header_end]
@@ -115,10 +110,15 @@ def process_http_message(data: bytes, is_request: bool = True, original_mode: in
             current_mode = temp_json.get("mode", 0)
         except: pass
 
-    if is_request:
+        logging.debug(f"\n--- ИСХОДНЫЙ ЗАПРОС (Mode: {current_mode}) ---\n{format_json_for_log(body)}\n-----------------------------")
         new_body = translate_request(body)
+        if body != new_body:
+            logging.debug(f"\n--- МОДИФИЦИРОВАННЫЙ ЗАПРОС ---\n{format_json_for_log(new_body)}\n-------------------------------")
     else:
+        logging.debug(f"\n--- ОТВЕТ КАРМЫ (Original Mode: {original_mode}) ---\n{format_json_for_log(body)}\n-----------------------------")
         new_body = translate_response(body, original_mode)
+        if body != new_body:
+            logging.debug(f"\n--- МОДИФИЦИРОВАННЫЙ ОТВЕТ В ПРОГРАММУ ---\n{format_json_for_log(new_body)}\n------------------------------------------")
 
     headers_str = headers_raw.decode('utf-8', errors='ignore')
     new_headers_str = re.sub(
@@ -153,7 +153,7 @@ def handle_client(pipe, karma_host: str, karma_port: int):
         win32file.FlushFileBuffers(pipe)
         
     except socket.timeout:
-        logging.error("Таймаут: Карма не ответила вовремя (проверьте доступность сервера штампов).")
+        logging.error("Таймаут: Карма не ответила вовремя.")
     except ConnectionRefusedError:
         logging.error(f"Отказ в соединении: убедитесь, что Карма запущена на {karma_host}:{karma_port}.")
     except Exception as e:
@@ -165,13 +165,13 @@ def handle_client(pipe, karma_host: str, karma_port: int):
         except: pass
 
 def main():
-    parser = argparse.ArgumentParser(description="Умный мост Named Pipe -> Native Linux Carma")
-    parser.add_argument('--karma-host', type=str, default='127.0.0.1', help='IP нативной Кармы')
-    parser.add_argument('--karma-port', type=int, default=8080, help='Порт нативной Кармы')
-    parser.add_argument('--pipe', type=str, default=r'\\.\pipe\carma', help='Имя Named Pipe')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--karma-host', type=str, default='127.0.0.1')
+    parser.add_argument('--karma-port', type=int, default=8080)
+    parser.add_argument('--pipe', type=str, default=r'\\.\pipe\carma')
     args = parser.parse_args()
     
-    logging.info(f"Запуск умного моста. Pipe: {args.pipe} -> Карма: {args.karma_host}:{args.karma_port}")
+    logging.info(f"Запуск умного моста (DEBUG MODE). Pipe: {args.pipe} -> Карма: {args.karma_host}:{args.karma_port}")
     
     while True:
         try:
@@ -186,7 +186,6 @@ def main():
             logging.error(f"Ошибка Pipe: {e}")
             time.sleep(1)
         except KeyboardInterrupt:
-            logging.info("Штатная остановка...")
             break
         except Exception as e:
             logging.error(f"Ошибка цикла: {e}")
