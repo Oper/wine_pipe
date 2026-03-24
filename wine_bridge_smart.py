@@ -13,7 +13,7 @@ from datetime import datetime
 
 # --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
 logging.basicConfig(
-    level=logging.DEBUG, # Включен максимальный уровень подробности
+    level=logging.DEBUG,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler('wine_bridge_debug.log', encoding='utf-8'),
@@ -21,23 +21,18 @@ logging.basicConfig(
     ]
 )
 
-# --- ХЕЛПЕРЫ ДЛЯ ЛОГОВ ---
 def format_json_for_log(raw_bytes: bytes) -> str:
-    """Пытается распарсить JSON и красиво его вывести, обрезая длинные base64 строки."""
     try:
         data_dict = json.loads(raw_bytes.decode('utf-8'))
         dump_dict = copy.deepcopy(data_dict)
-        # Идем по ключам и обрезаем гигантские строки (например, fileData)
         for k, v in dump_dict.items():
             if isinstance(v, str) and len(v) > 200:
                 dump_dict[k] = v[:50] + f"... [Строка обрезана, {len(v)} символов]"
         return json.dumps(dump_dict, ensure_ascii=False, indent=2)
     except Exception:
-        # Если это не JSON, возвращаем кусок сырых данных
         snippet = raw_bytes[:500]
         return snippet.decode('utf-8', errors='replace') + ("..." if len(raw_bytes) > 500 else "")
 
-# --- ГЕНЕРАЦИЯ ЗАГЛУШКИ ДЛЯ ПРОГРАММЫ ---
 def generate_eid_stub() -> str:
     now = datetime.now()
     time_str = now.strftime("%d.%m.%Y %H:%M:%S")
@@ -50,7 +45,6 @@ def generate_eid_stub() -> str:
     eid_utf16 = eid_raw.encode('utf-16le')
     return base64.b64encode(eid_utf16).decode('utf-8')
 
-# --- ТРАНСЛЯЦИЯ ЗАПРОСОВ И ОТВЕТОВ ---
 def translate_request(req_body: bytes) -> bytes:
     try:
         payload = json.loads(req_body.decode('utf-8'))
@@ -93,11 +87,10 @@ def translate_response(resp_body: bytes, original_mode: int) -> bytes:
     except:
         return resp_body
 
-# --- РАБОТА С HTTP И СЕТЬЮ ---
 def process_http_message(data: bytes, is_request: bool = True, original_mode: int = 0) -> tuple[bytes, int]:
     header_end = data.find(b'\r\n\r\n')
     if header_end == -1:
-        logging.warning("Получены данные без HTTP-заголовков!")
+        logging.warning("Внимание: Данные без HTTP-заголовков или неполные!")
         return data, 0 
 
     headers_raw = data[:header_end]
@@ -129,10 +122,55 @@ def process_http_message(data: bytes, is_request: bool = True, original_mode: in
     
     return new_headers_str.encode('utf-8') + b'\r\n\r\n' + new_body, current_mode
 
+
+# --- НОВЫЙ БЛОК: УМНОЕ ЧТЕНИЕ ИЗ PIPE ---
+def read_full_request_from_pipe(pipe) -> bytes:
+    """Считывает данные из Pipe, учитывая Content-Length HTTP-протокола."""
+    data = b""
+    
+    # 1. Читаем заголовки (до \r\n\r\n)
+    while b"\r\n\r\n" not in data:
+        try:
+            hr, chunk = win32file.ReadFile(pipe, 4096)
+            if not chunk: break
+            data += chunk
+        except pywintypes.error as e:
+            if e.args[0] == 109: return data # Broken pipe
+            raise
+
+    header_end = data.find(b"\r\n\r\n")
+    if header_end == -1:
+        return data
+
+    headers = data[:header_end]
+    match = re.search(br'(?i)Content-Length:\s*(\d+)', headers)
+    
+    # 2. Дочитываем тело, если есть Content-Length
+    if match:
+        cl = int(match.group(1))
+        body_len = len(data) - (header_end + 4)
+        bytes_left = cl - body_len
+        
+        while bytes_left > 0:
+            try:
+                hr, chunk = win32file.ReadFile(pipe, min(4096, bytes_left))
+                if not chunk: break
+                data += chunk
+                bytes_left -= len(chunk)
+            except pywintypes.error as e:
+                if e.args[0] == 109: break
+                raise
+                
+    return data
+
+
 def handle_client(pipe, karma_host: str, karma_port: int):
     try:
-        hr, req_data = win32file.ReadFile(pipe, 10 * 1024 * 1024) 
+        # Используем новую функцию умного чтения
+        req_data = read_full_request_from_pipe(pipe) 
         if not req_data: return
+
+        logging.debug(f"Считано из Pipe: {len(req_data)} байт.")
 
         mod_req_data, original_mode = process_http_message(req_data, is_request=True)
 
@@ -156,6 +194,9 @@ def handle_client(pipe, karma_host: str, karma_port: int):
         logging.error("Таймаут: Карма не ответила вовремя.")
     except ConnectionRefusedError:
         logging.error(f"Отказ в соединении: убедитесь, что Карма запущена на {karma_host}:{karma_port}.")
+    except pywintypes.error as e:
+        if e.args[0] != 109: # Игнорируем штатный обрыв канала
+            logging.error(f"Ошибка Windows API: {e}")
     except Exception as e:
         logging.exception(f"Ошибка сессии: {e}")
     finally:
@@ -171,10 +212,11 @@ def main():
     parser.add_argument('--pipe', type=str, default=r'\\.\pipe\carma')
     args = parser.parse_args()
     
-    logging.info(f"Запуск умного моста (DEBUG MODE). Pipe: {args.pipe} -> Карма: {args.karma_host}:{args.karma_port}")
+    logging.info(f"Запуск моста (HTTP Stream Fix). Pipe: {args.pipe} -> Карма: {args.karma_host}:{args.karma_port}")
     
     while True:
         try:
+            # Вернули BYTE режим для правильного потокового чтения
             pipe = win32pipe.CreateNamedPipe(
                 args.pipe, win32pipe.PIPE_ACCESS_DUPLEX,
                 win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
