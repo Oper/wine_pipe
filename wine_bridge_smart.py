@@ -72,37 +72,50 @@ def process_http_message(data: bytes, is_request: bool = True, original_mode: in
     return new_headers_str.encode('utf-8') + b'\r\n\r\n' + new_body, current_mode
 
 def read_full_data(pipe) -> bytes:
-    """Улучшенное чтение с ожиданием заполнения буфера."""
     data = b""
-    # Читаем первую порцию (заголовки)
+    # 1. Первичное чтение. Ждем появления хоть каких-то данных.
     try:
-        hr, chunk = win32file.ReadFile(pipe, 64*1024)
+        # Даем Wine небольшую паузу перед чтением, чтобы буфер наполнился
+        time.sleep(0.05) 
+        hr, chunk = win32file.ReadFile(pipe, 1024*1024)
         data += chunk
     except pywintypes.error as e:
         if e.args[0] == 109: return b""
         raise
 
-    # Если есть Content-Length, ждем остальное
+    # 2. Проверяем, нужны ли нам еще данные (ищем Content-Length)
+    # Используем поиск без учета регистра
     match = re.search(br'(?i)Content-Length:\s*(\d+)', data)
+    
     if match:
         content_length = int(match.group(1))
+        # Находим, где закончились заголовки
         header_end = data.find(b'\r\n\r\n')
-        
-        # Ждем, пока тело полностью дойдет (до 5 попыток с паузой)
+        if header_end == -1:
+            header_end = data.find(b'\n\n') # На случай упрощенного HTTP
+
+        if header_end != -1:
+            actual_body_len = len(data) - (header_end + 4 if b'\r\n\r\n' in data else header_end + 2)
+        else:
+            actual_body_len = 0
+
+        # 3. Дочитываем хвост, если он не пришел в первом пакете
         attempts = 0
-        while (len(data) < (header_end + 4 + content_length)) and attempts < 10:
+        while actual_body_len < content_length and attempts < 20:
             try:
-                # Проверяем, есть ли данные в канале без блокировки
-                flags, com_bytes, out_bytes, in_bytes = win32pipe.PeekNamedPipe(pipe, 0)
-                if in_bytes > 0:
-                    hr, chunk = win32file.ReadFile(pipe, in_bytes)
+                # Проверяем наличие данных без блокировки
+                _, avail, _, _ = win32pipe.PeekNamedPipe(pipe, 0)
+                if avail > 0:
+                    hr, chunk = win32file.ReadFile(pipe, avail)
                     data += chunk
+                    actual_body_len += len(chunk)
                 else:
-                    time.sleep(0.01) # Даем время системе наполнить буфер
+                    time.sleep(0.05)
                     attempts += 1
-            except: break
+            except:
+                break
             
-    # Сохраняем сырой дамп для анализа
+    # Сохраняем для финальной проверки
     with open('raw_pipe_data.bin', 'wb') as f:
         f.write(data)
         
@@ -152,11 +165,18 @@ def main():
     while True:
         try:
             # Используем MESSAGE режим, но читаем как байты — это самый совместимый вариант
-            pipe = win32pipe.CreateNamedPipe(
-                args.pipe, win32pipe.PIPE_ACCESS_DUPLEX,
-                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
-                win32pipe.PIPE_UNLIMITED_INSTANCES, 1024*1024, 1024*1024, 0, None
+                        pipe = win32pipe.CreateNamedPipe(
+                args.pipe,
+                win32pipe.PIPE_ACCESS_DUPLEX,
+                # Используем BYTE режим, так как программа шлет HTTP-поток
+                win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
+                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                2*1024*1024, # 2MB буфер на выход
+                2*1024*1024, # 2MB буфер на вход
+                0,
+                None
             )
+
             win32pipe.ConnectNamedPipe(pipe, None)
             handle_client(pipe, args.karma_host, args.karma_port)
         except KeyboardInterrupt: break
