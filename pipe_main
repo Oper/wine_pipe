@@ -130,15 +130,29 @@ def handle_client(hPipe):
         
         logger.debug(f"Получено тело: {body_bytes[:100]}...")
 
-        # 3. Пытаемся понять параметры
+        # 3. Пытаемся понять параметры (ОЧИЩАЕМ ОТ МУСОРА)
         mode = 0
         tsp_url = ""
+        
+        # Декодируем и обрезаем лишние пробелы, нулевые байты и невидимые символы
+        body_str = body_bytes.decode('utf-8', errors='ignore').strip('\x00\ufeff ')
+        
         try:
-            payload = json.loads(body_bytes.decode('utf-8', errors='ignore'))
-            mode = payload.get("mode", 0)
-            tsp_url = payload.get("TSP_URL", "")
-        except:
-            logger.warning("Тело запроса не является валидным JSON")
+            if body_str:
+                payload = json.loads(body_str)
+                mode = payload.get("mode", 0)
+                tsp_url = payload.get("TSP_URL", "")
+                logger.debug(f"JSON успешно распаршен. Mode: {mode}")
+            else:
+                logger.warning("Тело запроса пустое после очистки.")
+        except json.JSONDecodeError as je:
+            logger.error(f"ОШИБКА JSON: {je}. Сырые данные: {body_bytes!r}")
+            # Если мы не смогли распарсить JSON, но это потенциально важный запрос,
+            # мы можем попытаться найти mode:53 простым поиском по строке
+            if b'"mode":53' in body_bytes or b'"mode": 53' in body_bytes:
+                mode = 53
+                logger.warning("JSON битый, но обнаружен Mode 53 через поиск по строке! Включаем защиту.")
+
 
         # 4. Запрос на бэкенд
         logger.debug(f"Проксирование Mode {mode} на бэкенд...")
