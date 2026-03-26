@@ -152,18 +152,30 @@ def handle_client(hPipe):
         resp_content = resp.content
 
         # 5. Обработка Mode 53 (Обязательный штамп)
-        if mode == 53:
-            resp_content = process_mode_53(resp_content, tsp_url)
+        try:
+            # Если Mode 53 — пытаемся наложить штамп
+            if mode == 53:
+                resp_content = process_mode_53(resp_content, tsp_url)
+            
+            # Если всё хорошо (или это не 53 мод) — отправляем 200 OK
+            http_response = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: application/json; charset=utf-8\r\n"
+                f"Content-Length: {len(resp_content)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode('ascii') + resp_content
 
-        # 6. Формируем финальный HTTP ответ для Pipe
-        http_response = (
-            f"HTTP/1.1 200 OK\r\n"
-            f"Content-Type: application/json; charset=utf-8\r\n"
-            f"Content-Length: {len(resp_content)}\r\n"
-            f"Connection: close\r\n\r\n"
-        ).encode('ascii') + resp_content
+        except Exception as e:
+            logger.error(f"ОТКАЗ В ПОДПИСИ (Mode {mode}): {e}")
+            # ОТПРАВЛЯЕМ 500 ОШИБКУ КЛИЕНТУ
+            err_body = json.dumps({"error": str(e), "success": False}).encode('utf-8')
+            http_response = (
+                f"HTTP/1.1 500 Internal Server Error\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(err_body)}\r\n\r\n"
+            ).encode('ascii') + err_body
 
-        # 7. Отправляем в канал
+        # Отправляем то, что получилось (либо 200, либо 500)
         win32file.WriteFile(hPipe, http_response)
         logger.info(f"Запрос Mode {mode} успешно завершен.")
 
