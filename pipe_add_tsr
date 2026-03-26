@@ -1,4 +1,5 @@
-from asn1crypto import cms, tsp
+from asn1crypto import cms, tsp, algos
+from pygost import gost34112012256
 
 def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
     """
@@ -64,3 +65,31 @@ def extract_signature_for_tsq(cms_der: bytes) -> bytes:
     
     # Возвращаем сырые байты подписи
     return first_signer['signature'].contents
+
+def create_tsq(signature_bytes: bytes) -> bytes:
+    """
+    Создает бинарный запрос на штамп времени (TSQ) по ГОСТ Р 34.11-2012.
+    """
+    # 1. Вычисляем хеш от подписи (имитация pipe_http_tsp_gen_hash)
+    hasher = gost34112012256.GOST34112012256()
+    hasher.update(signature_bytes)
+    hashed_value = hasher.digest()
+
+    # 2. Формируем структуру MessageImprint
+    # OID для ГОСТ 2012 256 бит: 1.2.643.7.1.1.2.2
+    message_imprint = tsp.MessageImprint({
+        'hash_algorithm': algos.DigestAlgorithm({
+            'algorithm': '1.2.643.7.1.1.2.2' 
+        }),
+        'hashed_message': hashed_value
+    })
+
+    # 3. Создаем сам запрос TimeStampReq
+    ts_req = tsp.TimeStampReq({
+        'version': 'v1',
+        'message_imprint': message_imprint,
+        'cert_req': True, # Просим сервер прислать свой сертификат в ответе
+        'nonce': int.from_bytes(b'VIC', 'big') # Случайное число для защиты от повторов
+    })
+
+    return ts_req.dump()
