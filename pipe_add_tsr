@@ -1,0 +1,66 @@
+from asn1crypto import cms, tsp
+
+def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
+    """
+    Разбирает CMS подпись, добавляет к первой подписи штамп времени (TSR) 
+    как неаутентифицированный атрибут и возвращает обновленный CMS.
+    """
+    # 1. Загружаем исходную CMS структуру из DER-байтов
+    content_info = cms.ContentInfo.load(cms_der)
+    
+    # Убеждаемся, что это SignedData
+    if content_info['content_type'].native != 'signed_data':
+        raise ValueError("CMS не является SignedData")
+        
+    signed_data = content_info['content']
+    signer_infos = signed_data['signer_infos']
+    
+    if len(signer_infos) == 0:
+        raise ValueError("В CMS нет подписей (SignerInfos)")
+        
+    # 2. Берем первую подпись (SignerInfo)
+    first_signer = signer_infos[0]
+    
+    # 3. Загружаем ответ сервера штампов (TimeStampResp)
+    time_stamp_resp = tsp.TimeStampResp.load(tsr_der)
+    
+    # Проверяем статус ответа (0 или 1 - успешные статусы)
+    status = time_stamp_resp['status']['status'].native
+    if status not in ('granted', 'granted_with_mods'):
+        raise ValueError(f"Сервер штампов вернул ошибку: {status}")
+        
+    # Извлекаем сам TimeStampToken (это тоже структура ContentInfo)
+    ts_token = time_stamp_resp['time_stamp_token']
+    
+    # 4. Формируем новый неаутентифицированный атрибут со штампом времени.
+    # OID 1.2.840.113549.1.9.16.2.14 автоматически распознается asn1crypto 
+    # как 'signature_time_stamp_token'
+    ts_attribute = cms.CMSAttribute({
+        'type': 'signature_time_stamp_token',
+        'values': [ts_token]
+    })
+    
+    # 5. Инъекция атрибута
+    # Если поля unsigned_attrs еще нет (оно опциональное), создаем его
+    if first_signer['unsigned_attrs'].native is None:
+        first_signer['unsigned_attrs'] = cms.CMSAttributes([])
+        
+    # Добавляем штамп в список неаутентифицированных атрибутов
+    first_signer['unsigned_attrs'].append(ts_attribute)
+    
+    # 6. Собираем структуру обратно в DER
+    updated_cms_der = content_info.dump()
+    
+    return updated_cms_der
+
+def extract_signature_for_tsq(cms_der: bytes) -> bytes:
+    """
+    Извлекает само значение подписи из первой SignerInfo.
+    Именно от этих байтов нужно брать хеш для запроса на TSP сервер.
+    """
+    content_info = cms.ContentInfo.load(cms_der)
+    signed_data = content_info['content']
+    first_signer = signed_data['signer_infos'][0]
+    
+    # Возвращаем сырые байты подписи
+    return first_signer['signature'].contents
