@@ -5,11 +5,11 @@ import winerror
 import requests
 import json
 import base64
-import datetime
 import logging
 import traceback
+import threading
 from asn1crypto import cms, tsp, algos
-from pygost import gost34112012256
+import gostcrypto
 
 # --- НАСТРОЙКИ ---
 PIPE_NAME = r'\\.\pipe\carma'
@@ -21,7 +21,7 @@ logger = logging.getLogger("CarmaProxy")
 logger.setLevel(logging.DEBUG)
 fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
 ch = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
 fh.setFormatter(formatter)
 ch.setFormatter(formatter)
 logger.addHandler(fh)
@@ -58,8 +58,9 @@ def extract_signature_for_tsq(cms_der: bytes) -> bytes:
     return first_signer['signature'].contents
 
 def create_tsq(signature_bytes: bytes) -> bytes:
-    """Создает бинарный запрос на штамп времени (TSQ) по ГОСТ Р 34.11-2012."""
-    hasher = gost34112012256.GOST34112012256()
+    """Создает бинарный запрос на штамп времени (TSQ) по ГОСТ Р 34.11-2012 (256 бит)."""
+    # Используем gostcrypto вместо pygost
+    hasher = gostcrypto.gosthash.new('streebog256')
     hasher.update(signature_bytes)
     hashed_value = hasher.digest()
 
@@ -142,17 +143,81 @@ def process_mode_53(resp_body_bytes: bytes, tsp_url: str) -> bytes:
     except Exception as e:
         logger.error(f"Ошибка при наложении штампа в Mode 53: {e}")
         logger.error(traceback.format_exc())
-        # В случае ошибки возвращаем оригинальный ответ бэкенда, чтобы не сломать клиент
+        # В случае ошибки возвращаем оригинальный ответ бэкенда
         return resp_body_bytes
+
+# --- ФУНКЦИЯ ПОТОКА ДЛЯ КЛИЕНТА ---
+
+def handle_client(hPipe):
+    """Обрабатывает одно подключение в отдельном потоке."""
+    try:
+        # Чтение HTTP заголовков
+        hr, raw_headers = win32file.ReadFile(hPipe, 65536)
+        headers_str = raw_headers.decode('utf-8', errors='ignore')
+        cl = get_content_length(headers_str)
+        
+        # Чтение тела HTTP запроса
+        body_bytes = b""
+        while len(body_bytes) < cl:
+            hr, chunk = win32file.ReadFile(hPipe, 65536)
+            body_bytes += chunk
+            
+        body_str = body_bytes.decode('utf-8', errors='ignore')
+        
+        # Парсинг параметров
+        mode = 0
+        tsp_url = ""
+        try:
+            payload = json.loads(body_str)
+            mode = payload.get("mode", 0)
+            tsp_url = payload.get("TSP_URL", "")
+        except json.JSONDecodeError:
+            pass 
+            
+        logger.info(f"Запрос получен. Mode: {mode}, TSP_URL: {tsp_url}")
+        
+        # Проксирование на бэкенд
+        headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+        }
+        resp = requests.post(BACKEND_URL, data=body_bytes, headers=headers)
+        resp_body = resp.content
+        
+        # Модификация ответа
+        if mode == 53 and tsp_url:
+            resp_body = process_mode_53(resp_body, tsp_url)
+
+        # Отправка ответа клиенту
+        http_response = f"HTTP/1.0 200 OK\r\nContent-Length: {len(resp_body)}\r\n\r\n".encode('ascii') + resp_body
+        win32file.WriteFile(hPipe, http_response)
+        logger.info("Ответ успешно отправлен клиенту.")
+
+    except pywintypes.error as e:
+        if e.winerror == winerror.ERROR_BROKEN_PIPE:
+            logger.warning("Клиент разорвал соединение (Broken Pipe).")
+        else:
+            logger.error(f"Pipe error: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка в потоке обработки: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        try:
+            win32file.FlushFileBuffers(hPipe)
+            win32pipe.DisconnectNamedPipe(hPipe)
+            win32file.CloseHandle(hPipe)
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии pipe: {e}")
 
 # --- ГЛАВНЫЙ ЦИКЛ СЕРВЕРА ---
 
 def main():
-    logger.info("=== PIPE-HTTP Proxy Server Started ===")
+    logger.info("=== PIPE-HTTP Proxy Server Started (Multi-threaded) ===")
     
     while True:
         hPipe = None
         try:
+            # Создаем новый экземпляр Pipe для следующего клиента
             hPipe = win32pipe.CreateNamedPipe(
                 PIPE_NAME,
                 win32pipe.PIPE_ACCESS_DUPLEX,
@@ -161,69 +226,26 @@ def main():
                 65536, 65536, 0, None
             )
             
-            logger.info(f"Ожидание подключения клиента к {PIPE_NAME}...")
+            # Ждем подключения
             win32pipe.ConnectNamedPipe(hPipe, None)
-            logger.info("Клиент подключен.")
+            logger.info("Клиент подключен. Запуск фонового потока.")
             
-            # Чтение HTTP заголовков
-            hr, raw_headers = win32file.ReadFile(hPipe, 65536)
-            headers_str = raw_headers.decode('utf-8', errors='ignore')
-            cl = get_content_length(headers_str)
-            
-            # Чтение тела HTTP запроса
-            body_bytes = b""
-            while len(body_bytes) < cl:
-                hr, chunk = win32file.ReadFile(hPipe, 65536)
-                body_bytes += chunk
-                
-            body_str = body_bytes.decode('utf-8', errors='ignore')
-            
-            # Парсинг параметров из JSON тела (если есть)
-            mode = 0
-            tsp_url = ""
-            try:
-                payload = json.loads(body_str)
-                mode = payload.get("mode", 0)
-                tsp_url = payload.get("TSP_URL", "")
-            except json.JSONDecodeError:
-                pass # Если тело не JSON, просто проксируем как есть
-                
-            logger.info(f"Запрос получен. Mode: {mode}, TSP_URL: {tsp_url}")
-            
-            # Проксирование на бэкенд
-            headers = {
-                'Accept': 'application/json, text/javascript, */*; q=0.01',
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-            }
-            logger.debug("Отправка запроса на бэкенд...")
-            resp = requests.post(BACKEND_URL, data=body_bytes, headers=headers)
-            resp_body = resp.content
-            
-            # Модификация ответа
-            if mode == 53 and tsp_url:
-                resp_body = process_mode_53(resp_body, tsp_url)
-
-            # Формирование и отправка HTTP ответа в Pipe
-            http_response = f"HTTP/1.0 200 OK\r\nContent-Length: {len(resp_body)}\r\n\r\n".encode('ascii') + resp_body
-            win32file.WriteFile(hPipe, http_response)
-            logger.info("Ответ успешно отправлен клиенту.")
+            # Как только подключился - передаем дескриптор в поток и идем на следующий круг
+            client_thread = threading.Thread(target=handle_client, args=(hPipe,))
+            client_thread.daemon = True # Позволяет скрипту завершиться при закрытии
+            client_thread.start()
 
         except pywintypes.error as e:
-            if e.winerror == winerror.ERROR_BROKEN_PIPE:
-                logger.warning("Клиент разорвал соединение (Broken Pipe).")
-            else:
-                logger.error(f"Pipe error: {e}")
+            logger.error(f"Системная ошибка Pipe: {e}")
+            if hPipe:
+                win32file.CloseHandle(hPipe)
         except Exception as e:
             logger.error(f"Непредвиденная ошибка в главном цикле: {e}")
-            logger.error(traceback.format_exc())
-        finally:
             if hPipe:
                 try:
-                    win32file.FlushFileBuffers(hPipe)
-                    win32pipe.DisconnectNamedPipe(hPipe)
                     win32file.CloseHandle(hPipe)
-                except Exception as e:
-                    logger.error(f"Ошибка при закрытии pipe: {e}")
+                except:
+                    pass
 
 if __name__ == "__main__":
     main()
