@@ -1,0 +1,154 @@
+import win32pipe
+import win32file
+import pywintypes
+import winerror
+import requests
+import json
+import base64
+import datetime
+from asn1crypto import cms, tsp, algos
+# Требуется: pip install pywin32 requests asn1crypto pygost
+# from pygost import gost34112012256, gost341194  # Для хеширования
+
+PIPE_NAME = r'\\.\pipe\carma'
+BACKEND_URL = "http://127.0.0.1:8080/"
+
+def get_content_length(headers: str) -> int:
+    """Ищет Content-Length в HTTP-заголовках[span_9](start_span)[span_9](end_span)."""
+    for line in headers.split('\r\n'):
+        if line.lower().startswith("content-length:"):
+            return int(line.split(':')[1].strip())
+    return 0
+
+def get_tsr_from_tsa(url: str, tsq_der: bytes) -> bytes:
+    """Отправляет TSQ запрос на сервер и получает TSR[span_10](start_span)[span_10](end_span)."""
+    headers = {
+        'Content-Type': 'application/timestamp-query',
+        'Accept': 'application/timestamp-reply'
+    }
+    response = requests.post(url, data=tsq_der, headers=headers)
+    response.raise_for_status()
+    # WinHTTP код отрезал первые 9 байт (заголовки/артефакты), в Python requests 
+    # возвращает чистое тело, но если сервер отдает мусор в начале, нужно слайсить.
+    return response.content 
+
+def build_tst_extension_json(tst_info: tsp.TSTInfo, out_len: int, base64_tst: str) -> str:
+    """Формирует JSON с информацией о штампе (эквивалент pipe_http_tsp_get_extension)[span_11](start_span)[span_11](end_span)."""
+    # Вместо iconv и ручной конкатенации строк
+    serial = tst_info['serial_number'].native
+    gen_time = tst_info['gen_time'].native # datetime object
+    policy = tst_info['policy'].native
+    
+    local_time = gen_time + datetime.timedelta(hours=3)
+    
+    eid = (
+        f'version="V1";Serial="00{serial:X}";'
+        f'UtcTime="{gen_time.strftime("%d.%m.%Y %H:%M:%S")}";'
+        f'LocalTime="{local_time.strftime("%d.%m.%Y %H:%M:%S")}";'
+        f'Policy="{policy}";'
+        # Дальнейшая сборка HashAlg, HashValue и т.д.
+        f'Accuracy="";Ordering="Выкл.";Nonce="";Tsa="";'
+    )
+    
+    # Конвертация в UTF-16LE и Base64[span_12](start_span)[span_12](end_span)
+    eid_utf16le = eid.encode('utf-16le')
+    eid64 = base64.b64encode(eid_utf16le).decode('ascii')
+    
+    ext_json = {
+        "CoSigners": [],
+        "Extensions": [{
+            "ExtensionName": "Штамп времени",
+            "ExtensionOID": "1.2.840.113549.1.9.16.2.14",
+            "ExtensionInterpretedString": "Результат проверки подписи: Действительна; Результат проверки сертификата: Действителен;",
+            "ExtensionInterpretedData": eid64
+        }],
+        "isAttached": False
+    }
+    return json.dumps(ext_json, ensure_ascii=False)
+
+def main():
+    print("=== PIPE-HTTP proxy (Python Port) ===")
+    
+    while True:
+        try:
+            # Создаем именованный канал[span_13](start_span)[span_13](end_span)
+            hPipe = win32pipe.CreateNamedPipe(
+                PIPE_NAME,
+                win32pipe.PIPE_ACCESS_DUPLEX,
+                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                40000, 40000, 0, None
+            )
+            
+            print(f"Named pipe created: {PIPE_NAME}\nWaiting for clients...")
+            win32pipe.ConnectNamedPipe(hPipe, None)
+            print("Client connected.")
+            
+            # Читаем заголовки HTTP от клиента (DO)
+            hr, raw_headers = win32file.ReadFile(hPipe, 40000)
+            headers_str = raw_headers.decode('utf-8', errors='ignore')
+            cl = get_content_length(headers_str)
+            
+            # Читаем тело HTTP
+            body_bytes = b""
+            while len(body_bytes) < cl:
+                hr, chunk = win32file.ReadFile(hPipe, 40000)
+                body_bytes += chunk
+                
+            body_str = body_bytes.decode('utf-8', errors='ignore')
+            
+            # Определяем мод без использования strstr, используя нормальный JSON парсинг[span_14](start_span)[span_14](end_span)
+            mode = 0
+            mode_url = ""
+            mode_alg = ""
+            try:
+                # Предполагаем, что тело - это JSON или содержит его
+                payload = json.loads(body_str)
+                mode = payload.get("mode", 0)
+                mode_url = payload.get("TSP_URL", "")
+                mode_alg = payload.get("TSP_HASH_ALG_OID", "")
+            except json.JSONDecodeError:
+                pass # Не JSON, игнорируем
+                
+            # Проксируем запрос к Carma
+            headers = {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+            }
+            resp = requests.post(BACKEND_URL, data=body_bytes, headers=headers)
+            resp_body = resp.content
+            
+            # Обработка Mode 53 (Добавление штампа времени)[span_15](start_span)[span_15](end_span)
+            if mode == 53:
+                # В Python извлечь подпись и обновить JSON можно через словари
+                resp_data = json.loads(resp_body.decode('utf-8'))
+                
+                # Вся логика из C заменяется высокоуровневыми вызовами
+                # 1. Извлекаем CMS
+                # 2. asn1crypto.cms.ContentInfo.load(...)
+                # 3. pygost для хеширования (вместо pipe_http_tsp_gen_hash)
+                # 4. Получаем TSR от сервера (get_tsr_from_tsa)
+                # 5. Добавляем неаутентифицированный атрибут 1.2.840.113549.1.9.16.2.14
+                # 6. Обновляем JSON и resp_body
+                pass 
+                
+            elif mode == 55:
+                # Обработка Mode 55
+                pass
+
+            # Отправляем ответ обратно в Named Pipe[span_16](start_span)[span_16](end_span)
+            http_response = f"HTTP/1.0 200 OK\r\nContent-Length: {len(resp_body)}\r\n\r\n".encode('ascii') + resp_body
+            win32file.WriteFile(hPipe, http_response)
+
+        except pywintypes.error as e:
+            if e.winerror == winerror.ERROR_BROKEN_PIPE:
+                print("Client disconnected.")
+            else:
+                print(f"Pipe error: {e}")
+        finally:
+            win32file.FlushFileBuffers(hPipe)
+            win32pipe.DisconnectNamedPipe(hPipe)
+            win32file.CloseHandle(hPipe)
+
+if __name__ == "__main__":
+    main()
