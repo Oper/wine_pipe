@@ -115,33 +115,68 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
 # --- ПОТОК И ЦИКЛ ---
 
 def handle_client(hPipe):
+    """Улучшенная обработка клиента с защитой от разрывов"""
     try:
+        # 1. Читаем заголовок
         hr, raw_headers = win32file.ReadFile(hPipe, 65536)
         headers_str = raw_headers.decode('utf-8', errors='ignore')
-        cl = int(next((line.split(':')[1].strip() for line in headers_str.split('\r\n') if line.lower().startswith("content-length:")), 0))
         
+        # Находим длину тела
+        cl = 0
+        for line in headers_str.split('\r\n'):
+            if line.lower().startswith("content-length:"):
+                cl = int(line.split(':')[1].strip())
+        
+        # 2. Читаем тело (с защитой от недобора байтов)
         body_bytes = b""
-        while len(body_bytes) < cl:
-            hr, chunk = win32file.ReadFile(hPipe, 65536)
-            body_bytes += chunk
-            
-        payload = json.loads(body_bytes.decode('utf-8', errors='ignore'))
-        mode = payload.get("mode", 0)
-        tsp_url = payload.get("TSP_URL", "")
+        if cl > 0:
+            while len(body_bytes) < cl:
+                hr, chunk = win32file.ReadFile(hPipe, min(65536, cl - len(body_bytes)))
+                body_bytes += chunk
         
-        # Запрос на бэкенд
-        resp = requests.post(BACKEND_URL, data=body_bytes, timeout=30)
-        resp_body = resp.content
-        
-        # Если Mode 53 - применяем логику принудительного штампа
+        # Логируем для отладки
+        logger.debug(f"Получено тело: {body_bytes[:100]}...")
+
+        # 3. Пытаемся понять, что от нас хотят
+        mode = 0
+        tsp_url = ""
+        try:
+            payload = json.loads(body_bytes.decode('utf-8', errors='ignore'))
+            mode = payload.get("mode", 0)
+            tsp_url = payload.get("TSP_URL", "")
+        except:
+            logger.warning("Тело запроса не является валидным JSON")
+
+        # 4. Запрос на бэкенд с коротким таймаутом
+        logger.debug(f"Проксирование Mode {mode} на бэкенд...")
+        resp = requests.post(BACKEND_URL, data=body_bytes, timeout=20)
+        resp_content = resp.content
+
+        # 5. Обработка Mode 53 (Обязательный штамп)
         if mode == 53:
-            resp_body = process_mode_53(resp_body, tsp_url)
+            resp_content = process_mode_53(resp_content, tsp_url)
 
-        http_response = f"HTTP/1.0 200 OK\r\nContent-Length: {len(resp_body)}\r\n\r\n".encode('ascii') + resp_body
+        # 6. Формируем финальный ответ
+        http_response = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(resp_content)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode('ascii') + resp_content
+
+        # 7. Запись в Pipe
         win32file.WriteFile(hPipe, http_response)
+        logger.info(f"Запрос Mode {mode} успешно завершен.")
 
+    except pywintypes.error as e:
+        logger.error(f"Ошибка Windows Pipe (возможно таймаут клиента): {e}")
     except Exception as e:
-        logger.error(f"Client error: {e}")
+        logger.error(f"Общая ошибка в потоке: {e}")
+        # Пытаемся отправить ошибку клиенту, чтобы он не висел
+        try:
+            err_msg = b'{"error":"internal_proxy_error"}'
+            win32file.WriteFile(hPipe, f"HTTP/1.1 500 Error\r\nContent-Length: {len(err_msg)}\r\n\r\n".encode('ascii') + err_msg)
+        except: pass
     finally:
         try:
             win32file.FlushFileBuffers(hPipe)
