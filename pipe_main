@@ -73,146 +73,160 @@ def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
 def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     """
     Модифицирует ответ, добавляя штамп. 
-    Если что-то не так — выбрасывает исключение, которое поймает handle_client.
+    Безопасно проверяет, является ли ответ JSON-ом.
     """
     tsp_url = MANDATORY_TSP_URL if MANDATORY_TSP_URL else incoming_tsp_url
     
-    if not tsp_url:
-        logger.error("БЛОКИРОВКА: Адрес TSP не задан, а он обязателен.")
-        raise ValueError("TSP URL is missing")
+    # 1. Проверяем, не бинарный ли это файл (PDF начинается с %PDF)
+    if resp_body_bytes.startswith(b'%PDF') or b'xref' in resp_body_bytes:
+        logger.warning("Бэкенд вернул PDF/бинарные данные. Пропускаем наложение штампа.")
+        return resp_body_bytes
 
-    # Декодируем ответ бэкенда
-    data = json.loads(resp_body_bytes.decode('utf-8'))
-    cms_b64 = data.get("Signature")
-    if not cms_b64:
-        raise ValueError("Backend returned no signature")
+    try:
+        # 2. Пытаемся декодировать осторожно
+        # Используем 'ignore', чтобы не падать на случайных байтах, 
+        # но для JSON нам нужна чистая строка
+        resp_text = resp_body_bytes.decode('utf-8', errors='ignore').strip('\x00 ')
+        
+        # Если это не похоже на JSON (нет фигурной скобки), отдаем как есть
+        if not resp_text.startswith('{'):
+            logger.warning("Ответ бэкенда не является JSON. Отдаем 'как есть'.")
+            return resp_body_bytes
 
-    cms_der = base64.b64decode(cms_b64)
-    sig_bytes = extract_signature_for_tsq(cms_der)
-    tsq_der = create_tsq(sig_bytes)
-    
-    logger.info(f"Запрос обязательного штампа: {tsp_url}")
-    
-    # Запрос к TSA (серверу штампов)
-    ts_resp = requests.post(tsp_url, data=tsq_der, 
-                            headers={'Content-Type': 'application/timestamp-query'}, 
-                            timeout=10)
-    ts_resp.raise_for_status() # Если 404 или 500 — упадем здесь
-    
-    # Внедрение штампа (проверка статуса 'granted' внутри этой функции)
-    updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
-    
-    # Сборка успешного ответа
-    data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
-    return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        data = json.loads(resp_text)
+        cms_b64 = data.get("Signature")
+        
+        if not cms_b64:
+            logger.info("В JSON нет поля Signature, наложение штампа пропущено.")
+            return resp_body_bytes
+
+        # --- Далее логика наложения штампа (сокращено для краткости) ---
+        cms_der = base64.b64decode(cms_b64)
+        sig_bytes = extract_signature_for_tsq(cms_der)
+        tsq_der = create_tsq(sig_bytes)
+        
+        logger.info(f"Запрос штампа: {tsp_url}")
+        ts_resp = requests.post(tsp_url, data=tsq_der, 
+                                headers={'Content-Type': 'application/timestamp-query'}, 
+                                timeout=10)
+        ts_resp.raise_for_status()
+        
+        updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
+        data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+        
+        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+
+    except Exception as e:
+        # Если мы УВЕРЕНЫ, что это должен был быть JSON Mode 53, но штамп не поставился
+        # — тогда блокируем (как мы договорились ранее)
+        logger.error(f"КРИТИЧЕСКАЯ ОШИБКА в Mode 53: {e}")
+        raise # Пробрасываем ошибку выше, чтобы handle_client отправил 500
 
 # --- ПОТОК И ЦИКЛ ---
 
 def handle_client(hPipe):
-    """Улучшенная обработка клиента с защитой от разрывов и правильными заголовками"""
+    """
+    Финальная версия: Многопоточная обработка, очистка JSON, 
+    детектор бинарных данных и блокировка подписи без штампа.
+    """
     try:
-        # 1. Читаем заголовок
+        # 1. Читаем заголовок из Pipe
         hr, raw_headers = win32file.ReadFile(hPipe, 65536)
         headers_str = raw_headers.decode('utf-8', errors='ignore')
         
-        # Находим длину тела
+        # Находим длину тела запроса
         cl = 0
         for line in headers_str.split('\r\n'):
             if line.lower().startswith("content-length:"):
                 cl = int(line.split(':')[1].strip())
         
-        # 2. Читаем тело (с защитой от недобора байтов)
+        # 2. Читаем тело запроса целиком
         body_bytes = b""
         if cl > 0:
             while len(body_bytes) < cl:
                 hr, chunk = win32file.ReadFile(hPipe, min(65536, cl - len(body_bytes)))
                 body_bytes += chunk
         
-        logger.debug(f"Получено тело: {body_bytes[:100]}...")
-
-        # 3. Пытаемся понять параметры (МАКСИМАЛЬНАЯ ОЧИСТКА)
+        # 3. МАКСИМАЛЬНАЯ ОЧИСТКА И АНАЛИЗ ВХОДА
+        # Убираем нулевые байты и мусор, которые Wine/C++ могут подкинуть в Pipe
+        clean_input = body_bytes.replace(b'\x00', b'').replace(b'\xef\xbb\xbf', b'').strip()
+        
         mode = 0
         tsp_url = ""
         
-        # 1. Удаляем ВСЕ нулевые байты из массива (C-style завершители)
-        # 2. Удаляем UTF-8 BOM (\xef\xbb\xbf), если он есть
-        # 3. Обрезаем пробелы по краям
-        clean_bytes = body_bytes.replace(b'\x00', b'').replace(b'\xef\xbb\xbf', b'').strip()
-        
-        body_str = clean_bytes.decode('utf-8', errors='ignore')
-        
-        try:
-            if body_str:
-                payload = json.loads(body_str)
-                mode = payload.get("mode", 0)
-                tsp_url = payload.get("TSP_URL", "")
-                logger.debug(f"JSON распаршен чисто. Mode: {mode}")
-            else:
-                logger.warning("Тело запроса оказалось пустым после очистки.")
-        except json.JSONDecodeError as je:
-            # Если всё еще ошибка - выводим её в лог максимально подробно
-            logger.error(f"JSON всё еще битый: {je}")
-            logger.debug(f"Проблемная строка (repr): {body_str!r}")
-            
-            # Наш аварийный план (на случай спецсимволов)
-            if b'"mode":53' in clean_bytes or b'"mode": 53' in clean_bytes:
-                mode = 53
-                logger.warning("Включена аварийная защита для Mode 53")
+        # Проверяем, не PDF ли это на входе
+        if clean_input.startswith(b'%PDF'):
+            logger.info("На входе PDF/Бинарные данные. Пропускаем парсинг JSON.")
+        else:
+            try:
+                body_str = clean_input.decode('utf-8', errors='ignore')
+                if body_str.startswith('{'):
+                    payload = json.loads(body_str)
+                    mode = payload.get("mode", 0)
+                    tsp_url = payload.get("TSP_URL", "")
+                    logger.debug(f"JSON распаршен. Mode: {mode}")
+            except Exception as je:
+                logger.warning(f"Не удалось распарсить тело как JSON: {je}")
+                # Аварийная проверка на случай битого JSON для Mode 53
+                if b'"mode":53' in clean_input or b'"mode": 53' in clean_input:
+                    mode = 53
+                    logger.warning("Сработала аварийная защита: обнаружен Mode 53 в 'грязных' данных.")
 
-
-        # 4. Запрос на бэкенд
-        logger.debug(f"Проксирование Mode {mode} на бэкенд...")
+        # 4. ЗАПРОС НА БЭКЕНД
+        logger.debug(f"Проксирование запроса (Mode {mode}) на бэкенд...")
         req_headers = {
             'Accept': 'application/json, text/javascript, */*; q=0.01',
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
         }
         
-        # Выполняем запрос и ОБЯЗАТЕЛЬНО сохраняем контент в переменную
-        resp = requests.post(BACKEND_URL, data=body_bytes, headers=req_headers, timeout=20)
+        # Отправляем оригинальные байты (body_bytes) на бэкенд
+        resp = requests.post(BACKEND_URL, data=body_bytes, headers=req_headers, timeout=25)
         resp_content = resp.content
 
-        # 5. Обработка Mode 53 (Обязательный штамп)
+        # 5. ОБРАБОТКА И НАЛОЖЕНИЕ ШТАМПА (MODE 53)
         try:
-            # Если Mode 53 — пытаемся наложить штамп
             if mode == 53:
+                # Внутри process_mode_53 теперь встроена проверка на PDF и ошибки
                 resp_content = process_mode_53(resp_content, tsp_url)
             
-            # Если всё хорошо (или это не 53 мод) — отправляем 200 OK
-            http_response = (
-                f"HTTP/1.1 200 OK\r\n"
-                f"Content-Type: application/json; charset=utf-8\r\n"
-                f"Content-Length: {len(resp_content)}\r\n"
-                f"Connection: close\r\n\r\n"
-            ).encode('ascii') + resp_content
+            # Если всё прошло успешно (или это не 53 мод), формируем 200 OK
+            status_line = "HTTP/1.1 200 OK"
+            logger.info(f"Запрос Mode {mode} обработан успешно.")
 
         except Exception as e:
+            # Если наложение штампа сорвалось — БЛОКИРУЕМ ПОДПИСЬ
             logger.error(f"ОТКАЗ В ПОДПИСИ (Mode {mode}): {e}")
-            # ОТПРАВЛЯЕМ 500 ОШИБКУ КЛИЕНТУ
-            err_body = json.dumps({"error": str(e), "success": False}).encode('utf-8')
-            http_response = (
-                f"HTTP/1.1 500 Internal Server Error\r\n"
-                f"Content-Type: application/json\r\n"
-                f"Content-Length: {len(err_body)}\r\n\r\n"
-            ).encode('ascii') + err_body
+            resp_content = json.dumps({
+                "success": False, 
+                "error": "TIMESTAMP_MANDATORY_ERROR", 
+                "details": str(e)
+            }).encode('utf-8')
+            status_line = "HTTP/1.1 500 Internal Server Error"
 
-        # Отправляем то, что получилось (либо 200, либо 500)
+        # 6. ФОРМИРУЕМ ФИНАЛЬНЫЙ HTTP ОТВЕТ
+        http_response = (
+            f"{status_line}\r\n"
+            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(resp_content)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode('ascii') + resp_content
+
+        # 7. ОТПРАВЛЯЕМ В PIPE КЛИЕНТУ
         win32file.WriteFile(hPipe, http_response)
-        logger.info(f"Запрос Mode {mode} успешно завершен.")
 
     except pywintypes.error as e:
-        logger.error(f"Ошибка Windows Pipe (возможно таймаут клиента): {e}")
+        logger.error(f"Ошибка Windows Pipe: {e}")
     except Exception as e:
-        logger.error(f"Общая ошибка в потоке: {e}")
-        try:
-            err_msg = b'{"error":"internal_proxy_error"}'
-            win32file.WriteFile(hPipe, f"HTTP/1.1 500 Error\r\nContent-Length: {len(err_msg)}\r\n\r\n".encode('ascii') + err_msg)
-        except: pass
+        logger.error(f"Критический сбой в потоке: {e}")
+        logger.error(traceback.format_exc())
     finally:
+        # Всегда закрываем соединение
         try:
             win32file.FlushFileBuffers(hPipe)
             win32pipe.DisconnectNamedPipe(hPipe)
             win32file.CloseHandle(hPipe)
-        except: pass
+        except:
+            pass
 
 
 def main():
