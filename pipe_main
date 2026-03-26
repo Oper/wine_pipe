@@ -6,149 +6,224 @@ import requests
 import json
 import base64
 import datetime
+import logging
+import traceback
 from asn1crypto import cms, tsp, algos
-# Требуется: pip install pywin32 requests asn1crypto pygost
-# from pygost import gost34112012256, gost341194  # Для хеширования
+from pygost import gost34112012256
 
+# --- НАСТРОЙКИ ---
 PIPE_NAME = r'\\.\pipe\carma'
 BACKEND_URL = "http://127.0.0.1:8080/"
+LOG_FILE = "proxy_carma.log"
+
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+logger = logging.getLogger("CarmaProxy")
+logger.setLevel(logging.DEBUG)
+fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+ch = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh.setFormatter(formatter)
+ch.setFormatter(formatter)
+logger.addHandler(fh)
+logger.addHandler(ch)
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def get_content_length(headers: str) -> int:
-    """Ищет Content-Length в HTTP-заголовках[span_9](start_span)[span_9](end_span)."""
+    """Ищет Content-Length в HTTP-заголовках."""
     for line in headers.split('\r\n'):
         if line.lower().startswith("content-length:"):
             return int(line.split(':')[1].strip())
     return 0
 
 def get_tsr_from_tsa(url: str, tsq_der: bytes) -> bytes:
-    """Отправляет TSQ запрос на сервер и получает TSR[span_10](start_span)[span_10](end_span)."""
+    """Отправляет TSQ запрос на сервер и получает TSR."""
+    logger.debug(f"Отправка запроса на TSP сервер: {url}")
     headers = {
         'Content-Type': 'application/timestamp-query',
         'Accept': 'application/timestamp-reply'
     }
-    response = requests.post(url, data=tsq_der, headers=headers)
+    response = requests.post(url, data=tsq_der, headers=headers, timeout=15)
     response.raise_for_status()
-    # WinHTTP код отрезал первые 9 байт (заголовки/артефакты), в Python requests 
-    # возвращает чистое тело, но если сервер отдает мусор в начале, нужно слайсить.
-    return response.content 
+    logger.debug(f"Получен ответ от TSP сервера, размер: {len(response.content)} байт")
+    return response.content
 
-def build_tst_extension_json(tst_info: tsp.TSTInfo, out_len: int, base64_tst: str) -> str:
-    """Формирует JSON с информацией о штампе (эквивалент pipe_http_tsp_get_extension)[span_11](start_span)[span_11](end_span)."""
-    # Вместо iconv и ручной конкатенации строк
-    serial = tst_info['serial_number'].native
-    gen_time = tst_info['gen_time'].native # datetime object
-    policy = tst_info['policy'].native
+# --- КРИПТОГРАФИЯ И ASN.1 ---
+
+def extract_signature_for_tsq(cms_der: bytes) -> bytes:
+    """Извлекает значение подписи из первой SignerInfo."""
+    content_info = cms.ContentInfo.load(cms_der)
+    signed_data = content_info['content']
+    first_signer = signed_data['signer_infos'][0]
+    return first_signer['signature'].contents
+
+def create_tsq(signature_bytes: bytes) -> bytes:
+    """Создает бинарный запрос на штамп времени (TSQ) по ГОСТ Р 34.11-2012."""
+    hasher = gost34112012256.GOST34112012256()
+    hasher.update(signature_bytes)
+    hashed_value = hasher.digest()
+
+    message_imprint = tsp.MessageImprint({
+        'hash_algorithm': algos.DigestAlgorithm({'algorithm': '1.2.643.7.1.1.2.2'}),
+        'hashed_message': hashed_value
+    })
+
+    ts_req = tsp.TimeStampReq({
+        'version': 'v1',
+        'message_imprint': message_imprint,
+        'cert_req': True,
+        'nonce': int.from_bytes(b'VIC', 'big')
+    })
+    return ts_req.dump()
+
+def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
+    """Добавляет к первой подписи штамп времени (TSR) как неаутентифицированный атрибут."""
+    content_info = cms.ContentInfo.load(cms_der)
+    if content_info['content_type'].native != 'signed_data':
+        raise ValueError("CMS не является SignedData")
+        
+    signed_data = content_info['content']
+    signer_infos = signed_data['signer_infos']
     
-    local_time = gen_time + datetime.timedelta(hours=3)
+    if len(signer_infos) == 0:
+        raise ValueError("В CMS нет подписей (SignerInfos)")
+        
+    first_signer = signer_infos[0]
+    time_stamp_resp = tsp.TimeStampResp.load(tsr_der)
     
-    eid = (
-        f'version="V1";Serial="00{serial:X}";'
-        f'UtcTime="{gen_time.strftime("%d.%m.%Y %H:%M:%S")}";'
-        f'LocalTime="{local_time.strftime("%d.%m.%Y %H:%M:%S")}";'
-        f'Policy="{policy}";'
-        # Дальнейшая сборка HashAlg, HashValue и т.д.
-        f'Accuracy="";Ordering="Выкл.";Nonce="";Tsa="";'
-    )
+    status = time_stamp_resp['status']['status'].native
+    if status not in ('granted', 'granted_with_mods'):
+        raise ValueError(f"Сервер штампов вернул ошибку: {status}")
+        
+    ts_token = time_stamp_resp['time_stamp_token']
     
-    # Конвертация в UTF-16LE и Base64[span_12](start_span)[span_12](end_span)
-    eid_utf16le = eid.encode('utf-16le')
-    eid64 = base64.b64encode(eid_utf16le).decode('ascii')
+    ts_attribute = cms.CMSAttribute({
+        'type': 'signature_time_stamp_token',
+        'values': [ts_token]
+    })
     
-    ext_json = {
-        "CoSigners": [],
-        "Extensions": [{
-            "ExtensionName": "Штамп времени",
-            "ExtensionOID": "1.2.840.113549.1.9.16.2.14",
-            "ExtensionInterpretedString": "Результат проверки подписи: Действительна; Результат проверки сертификата: Действителен;",
-            "ExtensionInterpretedData": eid64
-        }],
-        "isAttached": False
-    }
-    return json.dumps(ext_json, ensure_ascii=False)
+    if first_signer['unsigned_attrs'].native is None:
+        first_signer['unsigned_attrs'] = cms.CMSAttributes([])
+        
+    first_signer['unsigned_attrs'].append(ts_attribute)
+    return content_info.dump()
+
+# --- ОБРАБОТКА БИЗНЕС-ЛОГИКИ ---
+
+def process_mode_53(resp_body_bytes: bytes, tsp_url: str) -> bytes:
+    """Логика обработки ответа от бэкенда для Mode 53 (наложение штампа)."""
+    try:
+        data = json.loads(resp_body_bytes.decode('utf-8'))
+        cms_b64 = data.get("Signature")
+        if not cms_b64:
+            logger.warning("Поле 'Signature' не найдено в ответе бэкенда.")
+            return resp_body_bytes
+            
+        logger.info("Начало обработки Mode 53: извлечение CMS")
+        cms_der = base64.b64decode(cms_b64)
+
+        sig_bytes = extract_signature_for_tsq(cms_der)
+        logger.debug("Подпись успешно извлечена, генерация TSQ")
+        
+        tsq_der = create_tsq(sig_bytes)
+        
+        logger.info("Запрос штампа времени")
+        tsr_der = get_tsr_from_tsa(tsp_url, tsq_der)
+
+        logger.info("Инъекция штампа времени в CMS")
+        updated_cms_der = inject_tsr_to_cms(cms_der, tsr_der)
+
+        # Обновляем JSON
+        data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+        logger.info("Mode 53 успешно обработан")
+        
+        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+
+    except Exception as e:
+        logger.error(f"Ошибка при наложении штампа в Mode 53: {e}")
+        logger.error(traceback.format_exc())
+        # В случае ошибки возвращаем оригинальный ответ бэкенда, чтобы не сломать клиент
+        return resp_body_bytes
+
+# --- ГЛАВНЫЙ ЦИКЛ СЕРВЕРА ---
 
 def main():
-    print("=== PIPE-HTTP proxy (Python Port) ===")
+    logger.info("=== PIPE-HTTP Proxy Server Started ===")
     
     while True:
+        hPipe = None
         try:
-            # Создаем именованный канал[span_13](start_span)[span_13](end_span)
             hPipe = win32pipe.CreateNamedPipe(
                 PIPE_NAME,
                 win32pipe.PIPE_ACCESS_DUPLEX,
                 win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
                 win32pipe.PIPE_UNLIMITED_INSTANCES,
-                40000, 40000, 0, None
+                65536, 65536, 0, None
             )
             
-            print(f"Named pipe created: {PIPE_NAME}\nWaiting for clients...")
+            logger.info(f"Ожидание подключения клиента к {PIPE_NAME}...")
             win32pipe.ConnectNamedPipe(hPipe, None)
-            print("Client connected.")
+            logger.info("Клиент подключен.")
             
-            # Читаем заголовки HTTP от клиента (DO)
-            hr, raw_headers = win32file.ReadFile(hPipe, 40000)
+            # Чтение HTTP заголовков
+            hr, raw_headers = win32file.ReadFile(hPipe, 65536)
             headers_str = raw_headers.decode('utf-8', errors='ignore')
             cl = get_content_length(headers_str)
             
-            # Читаем тело HTTP
+            # Чтение тела HTTP запроса
             body_bytes = b""
             while len(body_bytes) < cl:
-                hr, chunk = win32file.ReadFile(hPipe, 40000)
+                hr, chunk = win32file.ReadFile(hPipe, 65536)
                 body_bytes += chunk
                 
             body_str = body_bytes.decode('utf-8', errors='ignore')
             
-            # Определяем мод без использования strstr, используя нормальный JSON парсинг[span_14](start_span)[span_14](end_span)
+            # Парсинг параметров из JSON тела (если есть)
             mode = 0
-            mode_url = ""
-            mode_alg = ""
+            tsp_url = ""
             try:
-                # Предполагаем, что тело - это JSON или содержит его
                 payload = json.loads(body_str)
                 mode = payload.get("mode", 0)
-                mode_url = payload.get("TSP_URL", "")
-                mode_alg = payload.get("TSP_HASH_ALG_OID", "")
+                tsp_url = payload.get("TSP_URL", "")
             except json.JSONDecodeError:
-                pass # Не JSON, игнорируем
+                pass # Если тело не JSON, просто проксируем как есть
                 
-            # Проксируем запрос к Carma
+            logger.info(f"Запрос получен. Mode: {mode}, TSP_URL: {tsp_url}")
+            
+            # Проксирование на бэкенд
             headers = {
                 'Accept': 'application/json, text/javascript, */*; q=0.01',
                 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
             }
+            logger.debug("Отправка запроса на бэкенд...")
             resp = requests.post(BACKEND_URL, data=body_bytes, headers=headers)
             resp_body = resp.content
             
-            # Обработка Mode 53 (Добавление штампа времени)[span_15](start_span)[span_15](end_span)
-            if mode == 53:
-                # В Python извлечь подпись и обновить JSON можно через словари
-                resp_data = json.loads(resp_body.decode('utf-8'))
-                
-                # Вся логика из C заменяется высокоуровневыми вызовами
-                # 1. Извлекаем CMS
-                # 2. asn1crypto.cms.ContentInfo.load(...)
-                # 3. pygost для хеширования (вместо pipe_http_tsp_gen_hash)
-                # 4. Получаем TSR от сервера (get_tsr_from_tsa)
-                # 5. Добавляем неаутентифицированный атрибут 1.2.840.113549.1.9.16.2.14
-                # 6. Обновляем JSON и resp_body
-                pass 
-                
-            elif mode == 55:
-                # Обработка Mode 55
-                pass
+            # Модификация ответа
+            if mode == 53 and tsp_url:
+                resp_body = process_mode_53(resp_body, tsp_url)
 
-            # Отправляем ответ обратно в Named Pipe[span_16](start_span)[span_16](end_span)
+            # Формирование и отправка HTTP ответа в Pipe
             http_response = f"HTTP/1.0 200 OK\r\nContent-Length: {len(resp_body)}\r\n\r\n".encode('ascii') + resp_body
             win32file.WriteFile(hPipe, http_response)
+            logger.info("Ответ успешно отправлен клиенту.")
 
         except pywintypes.error as e:
             if e.winerror == winerror.ERROR_BROKEN_PIPE:
-                print("Client disconnected.")
+                logger.warning("Клиент разорвал соединение (Broken Pipe).")
             else:
-                print(f"Pipe error: {e}")
+                logger.error(f"Pipe error: {e}")
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка в главном цикле: {e}")
+            logger.error(traceback.format_exc())
         finally:
-            win32file.FlushFileBuffers(hPipe)
-            win32pipe.DisconnectNamedPipe(hPipe)
-            win32file.CloseHandle(hPipe)
+            if hPipe:
+                try:
+                    win32file.FlushFileBuffers(hPipe)
+                    win32pipe.DisconnectNamedPipe(hPipe)
+                    win32file.CloseHandle(hPipe)
+                except Exception as e:
+                    logger.error(f"Ошибка при закрытии pipe: {e}")
 
 if __name__ == "__main__":
     main()
