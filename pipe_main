@@ -115,7 +115,7 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
 # --- ПОТОК И ЦИКЛ ---
 
 def handle_client(hPipe):
-    """Улучшенная обработка клиента с защитой от разрывов"""
+    """Улучшенная обработка клиента с защитой от разрывов и правильными заголовками"""
     try:
         # 1. Читаем заголовок
         hr, raw_headers = win32file.ReadFile(hPipe, 65536)
@@ -134,10 +134,9 @@ def handle_client(hPipe):
                 hr, chunk = win32file.ReadFile(hPipe, min(65536, cl - len(body_bytes)))
                 body_bytes += chunk
         
-        # Логируем для отладки
         logger.debug(f"Получено тело: {body_bytes[:100]}...")
 
-        # 3. Пытаемся понять, что от нас хотят
+        # 3. Пытаемся понять параметры
         mode = 0
         tsp_url = ""
         try:
@@ -153,14 +152,16 @@ def handle_client(hPipe):
             'Accept': 'application/json, text/javascript, */*; q=0.01',
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
         }
+        
+        # Выполняем запрос и ОБЯЗАТЕЛЬНО сохраняем контент в переменную
         resp = requests.post(BACKEND_URL, data=body_bytes, headers=req_headers, timeout=20)
-
+        resp_content = resp.content
 
         # 5. Обработка Mode 53 (Обязательный штамп)
         if mode == 53:
             resp_content = process_mode_53(resp_content, tsp_url)
 
-        # 6. Формируем финальный ответ
+        # 6. Формируем финальный HTTP ответ для Pipe
         http_response = (
             f"HTTP/1.1 200 OK\r\n"
             f"Content-Type: application/json; charset=utf-8\r\n"
@@ -168,7 +169,7 @@ def handle_client(hPipe):
             f"Connection: close\r\n\r\n"
         ).encode('ascii') + resp_content
 
-        # 7. Запись в Pipe
+        # 7. Отправляем в канал
         win32file.WriteFile(hPipe, http_response)
         logger.info(f"Запрос Mode {mode} успешно завершен.")
 
@@ -176,7 +177,6 @@ def handle_client(hPipe):
         logger.error(f"Ошибка Windows Pipe (возможно таймаут клиента): {e}")
     except Exception as e:
         logger.error(f"Общая ошибка в потоке: {e}")
-        # Пытаемся отправить ошибку клиенту, чтобы он не висел
         try:
             err_msg = b'{"error":"internal_proxy_error"}'
             win32file.WriteFile(hPipe, f"HTTP/1.1 500 Error\r\nContent-Length: {len(err_msg)}\r\n\r\n".encode('ascii') + err_msg)
@@ -187,6 +187,7 @@ def handle_client(hPipe):
             win32pipe.DisconnectNamedPipe(hPipe)
             win32file.CloseHandle(hPipe)
         except: pass
+
 
 def main():
     global MANDATORY_TSP_URL
