@@ -1,5 +1,8 @@
 from asn1crypto import cms, tsp, algos
 from pygost import gost34112012256
+import json
+import base64
+import requests
 
 def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
     """
@@ -93,3 +96,43 @@ def create_tsq(signature_bytes: bytes) -> bytes:
     })
 
     return ts_req.dump()
+
+
+def process_mode_53(resp_body_json, tsp_url):
+    """
+    Логика обработки ответа от бэкенда для Mode 53.
+    """
+    try:
+        data = json.loads(resp_body_json)
+        # 1. Извлекаем исходный CMS (Base64 -> Bytes)
+        cms_b64 = data.get("Signature")
+        if not cms_b64:
+            return resp_body_json
+            
+        cms_der = base64.b64decode(cms_b64)
+
+        # 2. Получаем байты подписи, которые будем хешировать
+        sig_bytes = extract_signature_for_tsq(cms_der)
+
+        # 3. Генерируем TSQ (запрос)
+        tsq_der = create_tsq(sig_bytes)
+
+        # 4. Идем на внешний TSA сервер за штампом (замена WinHTTP)
+        # Мы используем функцию из первого сообщения
+        tsr_der = get_tsr_from_tsa(tsp_url, tsq_der)
+
+        # 5. Внедряем полученный штамп в CMS
+        updated_cms_der = inject_tsr_to_cms(cms_der, tsr_der)
+
+        # 6. Обновляем JSON для отправки клиенту
+        data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+        
+        # Дополнительно: можно добавить расширение (Extension) в JSON,
+        # как это делала ваша функция pipe_http_tsp_get_extension
+        # ...
+        
+        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+
+    except Exception as e:
+        print(f"Ошибка при наложении штампа: {e}")
+        return resp_body_json
