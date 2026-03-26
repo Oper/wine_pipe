@@ -147,10 +147,14 @@ def handle_client(hPipe):
         except:
             logger.warning("Тело запроса не является валидным JSON")
 
-        # 4. Запрос на бэкенд с коротким таймаутом
+        # 4. Запрос на бэкенд
         logger.debug(f"Проксирование Mode {mode} на бэкенд...")
-        resp = requests.post(BACKEND_URL, data=body_bytes, timeout=20)
-        resp_content = resp.content
+        req_headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+        }
+        resp = requests.post(BACKEND_URL, data=body_bytes, headers=req_headers, timeout=20)
+
 
         # 5. Обработка Mode 53 (Обязательный штамп)
         if mode == 53:
