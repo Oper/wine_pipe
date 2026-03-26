@@ -130,28 +130,34 @@ def handle_client(hPipe):
         
         logger.debug(f"Получено тело: {body_bytes[:100]}...")
 
-        # 3. Пытаемся понять параметры (ОЧИЩАЕМ ОТ МУСОРА)
+        # 3. Пытаемся понять параметры (МАКСИМАЛЬНАЯ ОЧИСТКА)
         mode = 0
         tsp_url = ""
         
-        # Декодируем и обрезаем лишние пробелы, нулевые байты и невидимые символы
-        body_str = body_bytes.decode('utf-8', errors='ignore').strip('\x00\ufeff ')
+        # 1. Удаляем ВСЕ нулевые байты из массива (C-style завершители)
+        # 2. Удаляем UTF-8 BOM (\xef\xbb\xbf), если он есть
+        # 3. Обрезаем пробелы по краям
+        clean_bytes = body_bytes.replace(b'\x00', b'').replace(b'\xef\xbb\xbf', b'').strip()
+        
+        body_str = clean_bytes.decode('utf-8', errors='ignore')
         
         try:
             if body_str:
                 payload = json.loads(body_str)
                 mode = payload.get("mode", 0)
                 tsp_url = payload.get("TSP_URL", "")
-                logger.debug(f"JSON успешно распаршен. Mode: {mode}")
+                logger.debug(f"JSON распаршен чисто. Mode: {mode}")
             else:
-                logger.warning("Тело запроса пустое после очистки.")
+                logger.warning("Тело запроса оказалось пустым после очистки.")
         except json.JSONDecodeError as je:
-            logger.error(f"ОШИБКА JSON: {je}. Сырые данные: {body_bytes!r}")
-            # Если мы не смогли распарсить JSON, но это потенциально важный запрос,
-            # мы можем попытаться найти mode:53 простым поиском по строке
-            if b'"mode":53' in body_bytes or b'"mode": 53' in body_bytes:
+            # Если всё еще ошибка - выводим её в лог максимально подробно
+            logger.error(f"JSON всё еще битый: {je}")
+            logger.debug(f"Проблемная строка (repr): {body_str!r}")
+            
+            # Наш аварийный план (на случай спецсимволов)
+            if b'"mode":53' in clean_bytes or b'"mode": 53' in clean_bytes:
                 mode = 53
-                logger.warning("JSON битый, но обнаружен Mode 53 через поиск по строке! Включаем защиту.")
+                logger.warning("Включена аварийная защита для Mode 53")
 
 
         # 4. Запрос на бэкенд
