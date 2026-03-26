@@ -72,57 +72,39 @@ def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
 
 def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     """
-    Модифицирует ответ, ОБЯЗАТЕЛЬНО добавляя штамп времени.
-    Если штамп не получен или невалиден, подпись УДАЛЯЕТСЯ из ответа.
+    Модифицирует ответ, добавляя штамп. 
+    Если что-то не так — выбрасывает исключение, которое поймает handle_client.
     """
     tsp_url = MANDATORY_TSP_URL if MANDATORY_TSP_URL else incoming_tsp_url
     
     if not tsp_url:
-        logger.error("КРИТИЧЕСКАЯ ОШИБКА: Адрес TSP сервера не задан!")
-        # Возвращаем JSON с ошибкой вместо подписи
-        return json.dumps({"error": "TSP_URL_MISSING", "success": False}).encode('utf-8')
+        logger.error("БЛОКИРОВКА: Адрес TSP не задан, а он обязателен.")
+        raise ValueError("TSP URL is missing")
 
-    try:
-        data = json.loads(resp_body_bytes.decode('utf-8'))
-        cms_b64 = data.get("Signature")
-        
-        if not cms_b64:
-            logger.error("Бэкенд не вернул подпись для наложения штампа.")
-            return resp_body_bytes
+    # Декодируем ответ бэкенда
+    data = json.loads(resp_body_bytes.decode('utf-8'))
+    cms_b64 = data.get("Signature")
+    if not cms_b64:
+        raise ValueError("Backend returned no signature")
 
-        cms_der = base64.b64decode(cms_b64)
-        sig_bytes = extract_signature_for_tsq(cms_der)
-        tsq_der = create_tsq(sig_bytes)
-        
-        logger.info(f"Запрос штампа (обязательно): {tsp_url}")
-        
-        # Запрос к серверу штампов
-        headers = {'Content-Type': 'application/timestamp-query', 'Accept': 'application/timestamp-reply'}
-        # Ставим таймаут поменьше, чтобы не вешать программу
-        ts_resp = requests.post(tsp_url, data=tsq_der, headers=headers, timeout=10)
-        
-        # Если сервер вернул 404, 500 или другую ошибку - упадем в блок except
-        ts_resp.raise_for_status() 
-        
-        # Пытаемся внедрить штамп. Если статус ответа TSA плохой, inject_tsr_to_cms выкинет ValueError
-        updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
-        
-        # Если дошли сюда - всё успешно
-        data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
-        logger.info("Штамп успешно наложен и проверен.")
-        return json.dumps(data, ensure_ascii=False).encode('utf-8')
-
-    except Exception as e:
-        logger.error(f"!!! БЛОКИРОВКА ПОДПИСИ !!! Ошибка штампа: {e}")
-        # Вместо оригинальной подписи возвращаем структуру с ошибкой.
-        # Вызывающая программа увидит, что поля Signature нет или оно пустое, и выдаст ошибку.
-        error_result = {
-            "success": False,
-            "error": "TIMESTAMP_FAILED",
-            "details": str(e),
-            "Signature": "" # Явно затираем подпись, чтобы она не ушла клиенту
-        }
-        return json.dumps(error_result).encode('utf-8')
+    cms_der = base64.b64decode(cms_b64)
+    sig_bytes = extract_signature_for_tsq(cms_der)
+    tsq_der = create_tsq(sig_bytes)
+    
+    logger.info(f"Запрос обязательного штампа: {tsp_url}")
+    
+    # Запрос к TSA (серверу штампов)
+    ts_resp = requests.post(tsp_url, data=tsq_der, 
+                            headers={'Content-Type': 'application/timestamp-query'}, 
+                            timeout=10)
+    ts_resp.raise_for_status() # Если 404 или 500 — упадем здесь
+    
+    # Внедрение штампа (проверка статуса 'granted' внутри этой функции)
+    updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
+    
+    # Сборка успешного ответа
+    data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+    return json.dumps(data, ensure_ascii=False).encode('utf-8')
 
 # --- ПОТОК И ЦИКЛ ---
 
