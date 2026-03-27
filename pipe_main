@@ -1,7 +1,6 @@
 import win32pipe
 import win32file
 import pywintypes
-import winerror
 import requests
 import json
 import base64
@@ -9,50 +8,50 @@ import logging
 import traceback
 import threading
 import sys
-from asn1crypto import cms, tsp, algos
+from asn1crypto import cms, tsp, core
 import gostcrypto
 
-# --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
+# --- НАСТРОЙКИ ---
 PIPE_NAME = r'\\.\pipe\carma'
 BACKEND_URL = "http://127.0.0.1:8080/"
 LOG_FILE = "proxy_carma.log"
-
-# Глобальная переменная для адреса TSP (из аргументов)
 MANDATORY_TSP_URL = None
 
 # --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
 logger = logging.getLogger("CarmaProxy")
 logger.setLevel(logging.DEBUG)
-fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
-ch = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
+
+fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
 fh.setFormatter(formatter)
+ch = logging.StreamHandler()
 ch.setFormatter(formatter)
+
 logger.addHandler(fh)
 logger.addHandler(ch)
 
-# --- КРИПТОГРАФИЧЕСКИЕ ФУНКЦИИ ---
+# --- КРИПТОГРАФИЧЕСКИЕ ФУНКЦИИ (ГОСТ 2012) ---
 
 def extract_signature_for_tsq(cms_der: bytes) -> bytes:
+    """Извлекает значение подписи для хеширования."""
     content_info = cms.ContentInfo.load(bytes(cms_der))
+    if content_info['content_type'].native != 'signed_data':
+        raise ValueError("CMS is not SignedData")
     signed_data = content_info['content']
-    # Берем значение подписи у первого подписанта
     signer_info = signed_data['signer_infos'][0]
-    signature_value = signer_info['signature'].native
-    return bytes(signature_value)
+    return bytes(signer_info['signature'].native)
 
 def create_tsq(sig_bytes: bytes) -> bytes:
-    # OID для ГОСТ Р 34.11-2012 256 бит: 1.2.643.7.1.1.2.2
-    # Если библиотеки для ГОСТ нет, временно оставим sha256 для теста, 
-    # но ПРАВИЛЬНЫЙ сервер Казначейства потребует ГОСТ.
-    import hashlib
-    hash_value = hashlib.sha256(sig_bytes).digest() 
+    """Создает запрос штампа с реальным ГОСТ-хешем."""
+    # ВАЖНО: Используем Стрибог-256 (ГОСТ Р 34.11-2012)
+    hasher = gostcrypto.gosthash.new('streebog256', data=sig_bytes)
+    hash_value = hasher.digest()
     
-    # ВАЖНО: Мы должны сказать серверу, какой алгоритм используем
-    # Попробуем явно указать идентификатор алгоритма
+    logger.debug(f"Вычислен ГОСТ-хеш подписи: {hash_value.hex()}")
+
     message_imprint = tsp.MessageImprint({
         'hash_algorithm': {
-            'algorithm': '1.2.643.7.1.1.2.2', # OID ГОСТ 2012 256
+            'algorithm': '1.2.643.7.1.1.2.2', # ГОСТ Р 34.11-2012 256 бит
         },
         'hashed_message': bytes(hash_value)
     })
@@ -65,60 +64,55 @@ def create_tsq(sig_bytes: bytes) -> bytes:
     return bytes(tsq.dump())
 
 def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
-    content_info = cms.ContentInfo.load(cms_der)
-    first_signer = content_info['content']['signer_infos'][0]
-    time_stamp_resp = tsp.TimeStampResp.load(tsr_der)
+    """Вшивает штамп времени в неподписанные атрибуты CMS."""
+    content_info = cms.ContentInfo.load(bytes(cms_der))
+    signer_info = content_info['content']['signer_infos'][0]
     
-    if time_stamp_resp['status']['status'].native not in ('granted', 'granted_with_mods'):
-        raise ValueError(f"TSA статус: {time_stamp_resp['status']['status'].native}")
+    # Парсим ответ TSP и проверяем статус
+    ts_resp = tsp.TimeStampResp.load(bytes(tsr_der))
+    status = ts_resp['status']['status'].native
+    if status not in ('granted', 'granted_with_mods'):
+        fail_info = ts_resp['status']['fail_info'].native if ts_resp['status']['fail_info'] else "no_info"
+        raise ValueError(f"TSA отказ: {status} ({fail_info})")
         
-    ts_token = time_stamp_resp['time_stamp_token']
-    ts_attribute = cms.CMSAttribute({'type': 'signature_time_stamp_token', 'values': [ts_token]})
+    ts_token = ts_resp['time_stamp_token']
     
-    if first_signer['unsigned_attrs'].native is None:
-        first_signer['unsigned_attrs'] = cms.CMSAttributes([])
-    first_signer['unsigned_attrs'].append(ts_attribute)
+    # OID для signature-time-stamp: 1.2.840.113549.1.9.16.2.14
+    ts_attribute = cms.CMSAttribute({
+        'type': '1.2.840.113549.1.9.16.2.14',
+        'values': [ts_token]
+    })
     
-    return content_info.dump()
+    # Инициализация атрибутов, если их нет
+    if isinstance(signer_info['unsigned_attrs'], core.Void):
+        signer_info['unsigned_attrs'] = cms.CMSAttributes([])
+    
+    signer_info['unsigned_attrs'].append(ts_attribute)
+    return bytes(content_info.dump())
 
-# --- ЛОГИКА MODE 53 (НАЛОЖЕНИЕ ШТАМПА) ---
+# --- ОБРАБОТКА MODE 53 ---
 
 def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
-    """
-    Обработка режима 53: извлечение CMS, получение штампа времени и сборка ответа.
-    Штамп времени является ОБЯЗАТЕЛЬНЫМ.
-    """
     tsp_url = MANDATORY_TSP_URL if MANDATORY_TSP_URL else incoming_tsp_url
-    
     if not tsp_url:
-        logger.error("КРИТИЧЕСКАЯ ОШИБКА: TSP URL не задан.")
         raise ValueError("TSP URL is missing")
 
-    # 1. Стерилизация и разделение данных
-    try:
-        curr_data = bytes(resp_body_bytes)
-        text_chunk = curr_data[:65536].decode('utf-8', errors='ignore')
-        
-        start_json_idx = text_chunk.find('{')
-        if start_json_idx == -1:
-            raise ValueError("Ответ бэкенда не содержит JSON")
+    # 1. Разделение JSON и бинарного хвоста
+    curr_data = bytes(resp_body_bytes)
+    text_chunk = curr_data[:65536].decode('utf-8', errors='ignore')
+    start_json_idx = text_chunk.find('{')
+    if start_json_idx == -1:
+        raise ValueError("Backend response is not JSON")
 
-        decoder = json.JSONDecoder()
-        data, end_idx_in_str = decoder.raw_decode(text_chunk[start_json_idx:])
-        
-        # Находим точный байтовый офсет конца JSON
-        json_only_str = text_chunk[:start_json_idx + end_idx_in_str]
-        byte_offset = len(json_only_str.encode('utf-8'))
-        
-        header_bytes = curr_data[:byte_offset]
-        binary_tail = curr_data[byte_offset:].strip(b'\r\n\x00 ')
-        
-        logger.debug(f"Данные разделены. Заголовок: {byte_offset} байт, Хвост: {len(binary_tail)} байт")
-    except Exception as e:
-        logger.error(f"Ошибка парсинга структуры ответа: {e}")
-        raise
+    decoder = json.JSONDecoder()
+    data, end_idx_in_str = decoder.raw_decode(text_chunk[start_json_idx:])
+    
+    json_only_str = text_chunk[:start_json_idx + end_idx_in_str]
+    byte_offset = len(json_only_str.encode('utf-8'))
+    header_bytes = curr_data[:byte_offset]
+    binary_tail = curr_data[byte_offset:].strip(b'\r\n\x00 ')
 
-    # 2. Поиск CMS подписи
+    # 2. Поиск CMS
     cms_b64 = data.get("Signature") or data.get("signature")
     is_json_mode = False
     
@@ -128,71 +122,38 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     elif len(binary_tail) > 100:
         cms_der = bytes(binary_tail)
         is_json_mode = False
-        logger.info("Подпись извлечена из бинарного хвоста.")
     else:
-        logger.error("Подпись не найдена ни в JSON, ни в хвосте.")
-        raise ValueError("Signature not found")
+        raise ValueError("Signature not found in response")
 
-    # 3. Получение штампа времени (Строгий режим)
-    try:
-        # Извлекаем значение подписи (signature value) для хеширования
-        sig_value_bytes = extract_signature_for_tsq(cms_der)
-        
-        # Создаем запрос (TSQ)
-        tsq_der = create_tsq(sig_value_bytes)
-        
-        logger.info(f"Запрос штампа времени в TSP: {tsp_url}")
-        ts_resp = requests.post(
-            tsp_url, 
-            data=bytes(tsq_der), 
-            headers={'Content-Type': 'application/timestamp-query'}, 
-            timeout=15
-        )
-        ts_resp.raise_for_status()
-        
-        # ПАРСИНГ ОТВЕТА TSP
-        ts_resp_content = bytes(ts_resp.content)
-        tsp_response = tsp.TimeStampResp.load(ts_resp_content)
-        
-        status_info = tsp_response['status']
-        status = status_info['status'].native
-        
-        if status not in ['granted', 'granted_with_mods']:
-            # Извлекаем детальную ошибку от сервера
-            fail_info = status_info['fail_info'].native if status_info['fail_info'] else "no_details"
-            status_str = status_info['status_string'].native if status_info['status_string'] else "no_message"
-            logger.error(f"TSP сервер отказал в штампе! Статус: {status}, Ошибка: {fail_info}, Сообщение: {status_str}")
-            raise RuntimeError(f"TSP Server rejected request: {status} ({fail_info})")
+    # 3. Штамп времени
+    sig_val = extract_signature_for_tsq(cms_der)
+    tsq_der = create_tsq(sig_val)
+    
+    logger.info(f"Запрос штампа (Mode 53) -> {tsp_url}")
+    ts_resp = requests.post(
+        tsp_url, 
+        data=tsq_der, 
+        headers={'Content-Type': 'application/timestamp-query'}, 
+        timeout=15
+    )
+    ts_resp.raise_for_status()
+    
+    updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
+    logger.info("Штамп успешно интегрирован.")
 
-        # Если статус OK, берем токен (поле time_stamp_token теперь точно на месте)
-        ts_token = tsp_response['time_stamp_token']
-        
-        # 4. Вшиваем штамп в CMS
-        updated_cms_der = inject_tsr_to_cms(cms_der, ts_token.dump())
-        logger.info("Штамп времени успешно интегрирован в подпись.")
-        
-        # 5. Сборка финального ответа
-        if is_json_mode:
-            field_name = "Signature" if "Signature" in data else "signature"
-            data[field_name] = base64.b64encode(updated_cms_der).decode('ascii')
-            return json.dumps(data, ensure_ascii=False).encode('utf-8')
-        else:
-            # Возвращаем в исходном формате: JSON + Бинарный хвост
-            return header_bytes + updated_cms_der
+    # 4. Сборка обратно
+    if is_json_mode:
+        field_name = "Signature" if "Signature" in data else "signature"
+        data[field_name] = base64.b64encode(updated_cms_der).decode('ascii')
+        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+    else:
+        return header_bytes + updated_cms_der
 
-    except Exception as e:
-        logger.critical(f"НЕУДАЧА ПРИ НАЛОЖЕНИИ ОБЯЗАТЕЛЬНОГО ШТАМПА: {e}")
-        # Блокируем выдачу подписи без штампа
-        raise RuntimeError(f"Mandatory timestamp failed: {e}")
-
-# --- ПОТОК И ЦИКЛ ---
+# --- ЛОГИКА ТРУБЫ (PIPE) ---
 
 def handle_client(hPipe):
-    """
-    Обработка клиента. Сверхпрочная очистка JSON и детектор бинарных данных.
-    """
     try:
-        # Читаем заголовки
+        # Чтение запроса
         hr, raw_headers = win32file.ReadFile(hPipe, 65536)
         headers_str = raw_headers.decode('utf-8', errors='ignore')
         
@@ -201,65 +162,49 @@ def handle_client(hPipe):
             if line.lower().startswith("content-length:"):
                 cl = int(line.split(':')[1].strip())
         
-        # Читаем тело
         body_bytes = b""
         if cl > 0:
             while len(body_bytes) < cl:
                 hr, chunk = win32file.ReadFile(hPipe, min(65536, cl - len(body_bytes)))
                 body_bytes += chunk
         
-        # Очистка входа от нулевых байтов и мусора
-        clean_input = body_bytes.replace(b'\x00', b'').replace(b'\xef\xbb\xbf', b'').strip()
+        clean_input = body_bytes.replace(b'\x00', b'').strip()
         
         mode = 0
         tsp_url = ""
         
-        # Анализ запроса
-        if clean_input.startswith(b'%PDF'):
-            logger.info("На входе PDF. Пропускаем парсинг JSON.")
-        else:
-            try:
-                body_str = clean_input.decode('utf-8', errors='ignore').lstrip()
-                if body_str.startswith('{'):
-                    # raw_decode игнорирует любой мусор после закрывающей скобки }
-                    payload, _ = json.JSONDecoder().raw_decode(body_str)
-                    mode = payload.get("mode", 0)
-                    tsp_url = payload.get("TSP_URL", "")
-                    logger.debug(f"JSON распаршен чисто (мусор отсечен). Mode: {mode}")
-            except Exception as je:
-                logger.warning(f"Не удалось распарсить тело как JSON: {je}")
-                if b'"mode":53' in clean_input or b'"mode": 53' in clean_input:
-                    mode = 53
-                    logger.warning("Сработала аварийная защита: обнаружен Mode 53.")
+        # Парсинг Mode
+        try:
+            body_str = clean_input.decode('utf-8', errors='ignore').lstrip()
+            if body_str.startswith('{'):
+                payload, _ = json.JSONDecoder().raw_decode(body_str)
+                mode = payload.get("mode", 0)
+                tsp_url = payload.get("TSP_URL", "")
+        except:
+            if b'"mode":53' in clean_input or b'"mode": 53' in clean_input:
+                mode = 53
 
-        # Проксирование на бэкенд
-        logger.debug(f"Проксирование запроса (Mode {mode}) на бэкенд...")
-        req_headers = {
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-        }
-        
+        # Проксирование
+        req_headers = {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}
         resp = requests.post(BACKEND_URL, data=body_bytes, headers=req_headers, timeout=25)
         resp_content = resp.content
 
         # Обработка Mode 53
-        try:
-            if mode == 53:
+        status_line = "HTTP/1.1 200 OK"
+        if mode == 53:
+            try:
                 resp_content = process_mode_53(resp_content, tsp_url)
-            
-            status_line = "HTTP/1.1 200 OK"
-            logger.info(f"Запрос Mode {mode} обработан успешно.")
+                logger.info("Запрос Mode 53 успешно завершен со штампом.")
+            except Exception as e:
+                logger.error(f"ОТКАЗ В ШТАМПЕ: {e}")
+                resp_content = json.dumps({
+                    "success": False, 
+                    "error": "TIMESTAMP_ERROR", 
+                    "details": str(e)
+                }).encode('utf-8')
+                status_line = "HTTP/1.1 500 Internal Server Error"
 
-        except Exception as e:
-            logger.error(f"ОТКАЗ В ПОДПИСИ (Mode {mode}): {e}")
-            resp_content = json.dumps({
-                "success": False, 
-                "error": "TIMESTAMP_MANDATORY_ERROR", 
-                "details": str(e)
-            }).encode('utf-8')
-            status_line = "HTTP/1.1 500 Internal Server Error"
-
-        # Формирование ответа
+        # Ответ клиенту
         http_response = (
             f"{status_line}\r\n"
             f"Content-Type: application/json; charset=utf-8\r\n"
@@ -269,31 +214,24 @@ def handle_client(hPipe):
 
         win32file.WriteFile(hPipe, http_response)
 
-    except pywintypes.error as e:
-        logger.error(f"Ошибка Windows Pipe: {e}")
     except Exception as e:
-        logger.error(f"Критический сбой в потоке: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Сбой в потоке: {e}")
     finally:
         try:
             win32file.FlushFileBuffers(hPipe)
             win32pipe.DisconnectNamedPipe(hPipe)
             win32file.CloseHandle(hPipe)
-        except:
-            pass
+        except: pass
 
 def main():
     global MANDATORY_TSP_URL
     if len(sys.argv) > 1:
         MANDATORY_TSP_URL = sys.argv[1]
-        logger.info(f"ПРИНУДИТЕЛЬНЫЙ адрес штампа времени: {MANDATORY_TSP_URL}")
-    else:
-        logger.warning("Параметр штампа не задан. Будет использован TSP_URL из запроса.")
+        logger.info(f"Принудительный TSP: {MANDATORY_TSP_URL}")
 
-    logger.info("=== Start Multi-threaded Proxy with Clean JSON ===")
+    logger.info("=== Proxy Ready (Named Pipe: carma) ===")
     
     while True:
-        hPipe = None
         try:
             hPipe = win32pipe.CreateNamedPipe(
                 PIPE_NAME,
@@ -302,22 +240,12 @@ def main():
                 win32pipe.PIPE_UNLIMITED_INSTANCES,
                 65536, 65536, 0, None
             )
-            
             win32pipe.ConnectNamedPipe(hPipe, None)
-            
-            client_thread = threading.Thread(target=handle_client, args=(hPipe,))
-            client_thread.daemon = True
-            client_thread.start()
-
-        except pywintypes.error as e:
-            logger.error(f"Системная ошибка Pipe: {e}")
-            if hPipe:
-                win32file.CloseHandle(hPipe)
+            t = threading.Thread(target=handle_client, args=(hPipe,))
+            t.daemon = True
+            t.start()
         except Exception as e:
-            logger.error(f"Непредвиденная ошибка: {e}")
-            if hPipe:
-                try: win32file.CloseHandle(hPipe)
-                except: pass
+            logger.error(f"Ошибка цикла: {e}")
 
 if __name__ == "__main__":
     main()
