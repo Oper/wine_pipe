@@ -185,35 +185,6 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
         # Блокируем выдачу подписи без штампа
         raise RuntimeError(f"Mandatory timestamp failed: {e}")
 
-# --- Обновленные вспомогательные функции для работы с ГОСТ ---
-
-def create_tsq(sig_bytes: bytes) -> bytes:
-    """Создает TimeStampReq. Используем SHA-256 как заглушку, 
-    но с OID ГОСТ 2012 для проверки реакции сервера."""
-    # В идеале здесь должен быть ГОСТ-хеш подписи
-    hash_value = hashlib.sha256(sig_bytes).digest() 
-    
-    message_imprint = tsp.MessageImprint({
-        'hash_algorithm': {
-            'algorithm': '1.2.643.7.1.1.2.2', # ГОСТ Р 34.11-2012 256 бит
-        },
-        'hashed_message': bytes(hash_value)
-    })
-    
-    tsq = tsp.TimeStampReq({
-        'version': 'v1',
-        'message_imprint': message_imprint,
-        'cert_req': True
-    })
-    return bytes(tsq.dump())
-
-def extract_signature_for_tsq(cms_der: bytes) -> bytes:
-    """Извлекает значение подписи из CMS."""
-    content_info = cms.ContentInfo.load(bytes(cms_der))
-    signed_data = content_info['content']
-    signer_info = signed_data['signer_infos'][0]
-    return bytes(signer_info['signature'].native)
-
 # --- ПОТОК И ЦИКЛ ---
 
 def handle_client(hPipe):
