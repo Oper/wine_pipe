@@ -80,39 +80,55 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
         logger.error("БЛОКИРОВКА: Адрес TSP не задан.")
         raise ValueError("TSP URL is missing")
 
-    # 1. Отделяем JSON от "хвоста" (бинарных данных)
-    # Находим индекс первой закрывающей фигурной скобки, за которой нет данных JSON
     try:
-        resp_text = resp_body_bytes.decode('utf-8', errors='ignore')
+        # 1. Декодируем только начало (достаточно для любого JSON-заголовка)
+        # Берем первые 64КБ, чтобы не пытаться декодировать весь бинарный хвост
+        text_chunk = resp_body_bytes[:65536].decode('utf-8', errors='ignore')
+        start_json_idx = text_chunk.find('{')
+        if start_json_idx == -1:
+            return resp_body_bytes
+
         decoder = json.JSONDecoder()
-        data, index = decoder.raw_decode(resp_text.lstrip())
+        data, end_idx_in_str = decoder.raw_decode(text_chunk[start_json_idx:])
         
-        # Индекс начала "хвоста" в байтах
-        # (учитываем возможные пробелы в начале, lstrip)
-        start_offset = resp_body_bytes.find(b'{') + index
-        binary_tail = resp_body_bytes[start_offset:].strip(b'\r\n\x00 ')
+        # 2. ВАЖНО: Находим точный БАЙТОВЫЙ индекс конца JSON
+        # Берем подстроку, которая является чистым JSON, и считаем её байты в UTF-8
+        json_only_str = text_chunk[:start_json_idx + end_idx_in_str]
+        byte_offset = len(json_only_str.encode('utf-8'))
         
-        logger.debug(f"JSON распаршен. Длина хвоста: {len(binary_tail)} байт.")
+        # Оригинальный заголовок (все байты до конца JSON)
+        header_bytes = resp_body_bytes[:byte_offset]
+        # Хвост — всё, что после
+        binary_tail = resp_body_bytes[byte_offset:].strip(b'\r\n\x00 ')
+        
+        logger.debug(f"JSON отделен. Байт в заголовке: {byte_offset}, Длина хвоста: {len(binary_tail)}")
     except Exception as e:
-        logger.error(f"Ошибка разделения JSON и бинарных данных: {e}")
+        logger.error(f"Ошибка разделения данных: {e}")
         return resp_body_bytes
 
-    # 2. Пытаемся понять, где подпись
-    # Если в JSON нет поля Signature, значит подпись — это и есть binary_tail
+    # 3. Определяем, где подпись
     cms_b64 = data.get("Signature") or data.get("signature")
+    is_json_mode = False
     
     if cms_b64:
         cms_der = base64.b64decode(cms_b64)
         is_json_mode = True
-    elif len(binary_tail) > 100: # Если хвост достаточно большой, считаем его подписью
+    elif len(binary_tail) > 100:
         cms_der = binary_tail
-        is_json_mode = False
-        logger.info("Подпись взята из бинарного хвоста ответа.")
+        # На всякий случай: если хвост выглядит как Base64 (текстовый), декодируем его
+        if binary_tail[:1] in b'MI': # CMS в DER обычно начинается с 'MII...' в Base64 или 0x30 в бинарнике
+             try:
+                 # Проверка: если это валидный Base64
+                 cms_der = base64.b64decode(binary_tail, validate=True)
+                 logger.info("Хвост был в Base64, успешно декодирован.")
+             except:
+                 pass # Значит это чистый DER бинарник
+        logger.info("Подпись взята из бинарного хвоста.")
     else:
-        logger.error("Подпись не найдена ни в JSON, ни в хвосте.")
+        logger.error("Подпись не найдена.")
         return resp_body_bytes
 
-    # 3. Накладываем штамп
+    # 4. Наложение штампа (стандартный блок)
     try:
         sig_bytes = extract_signature_for_tsq(cms_der)
         tsq_der = create_tsq(sig_bytes)
@@ -123,23 +139,19 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
         ts_resp.raise_for_status() 
         
         updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
-        logger.info("Штамп времени успешно вшит в CMS.")
         
-        # 4. Собираем ответ обратно
         if is_json_mode:
-            # Если подпись была внутри JSON
             field_name = "Signature" if "Signature" in data else "signature"
             data[field_name] = base64.b64encode(updated_cms_der).decode('ascii')
             return json.dumps(data, ensure_ascii=False).encode('utf-8')
         else:
-            # Если подпись шла хвостом (как в твоем случае)
-            # Возвращаем JSON + обновленный бинарный хвост
-            header_json = json.dumps(data, ensure_ascii=False).encode('utf-8')
-            return header_json + b'\r\n' + updated_cms_der
+            # Возвращаем «как было»: оригинальный заголовок + новая бинарная подпись
+            logger.info("Сборка ответа: оригинальный JSON + обновленный бинарный хвост.")
+            return header_bytes + updated_cms_der
 
     except Exception as e:
-        logger.error(f"Критическая ошибка при наложении штампа: {e}")
-        raise
+        logger.error(f"Ошибка штампа: {e}")
+        return resp_body_bytes
 
 
 # --- ПОТОК И ЦИКЛ ---
