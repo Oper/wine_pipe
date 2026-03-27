@@ -42,18 +42,19 @@ def extract_signature_for_tsq(cms_der: bytes) -> bytes:
     return bytes(signature_value)
 
 def create_tsq(sig_bytes: bytes) -> bytes:
-    # Хешируем саму подпись (вычисленное значение подписи)
-    # Используем ГОСТ 34.11-2012 256 бит (1.2.643.7.1.1.2.2)
+    # OID для ГОСТ Р 34.11-2012 256 бит: 1.2.643.7.1.1.2.2
+    # Если библиотеки для ГОСТ нет, временно оставим sha256 для теста, 
+    # но ПРАВИЛЬНЫЙ сервер Казначейства потребует ГОСТ.
     import hashlib
-    # Если используете специфический алгоритм, убедитесь, что хеш - это bytes
     hash_value = hashlib.sha256(sig_bytes).digest() 
     
+    # ВАЖНО: Мы должны сказать серверу, какой алгоритм используем
+    # Попробуем явно указать идентификатор алгоритма
     message_imprint = tsp.MessageImprint({
         'hash_algorithm': {
-            'algorithm': 'sha256', # Или ваш OID ГОСТа
+            'algorithm': '1.2.643.7.1.1.2.2', # OID ГОСТ 2012 256
         },
-        # КРИТИЧНО: принудительно приводим к bytes
-        'hashed_message': bytes(hash_value) 
+        'hashed_message': bytes(hash_value)
     })
     
     tsq = tsp.TimeStampReq({
@@ -61,7 +62,6 @@ def create_tsq(sig_bytes: bytes) -> bytes:
         'message_imprint': message_imprint,
         'cert_req': True
     })
-    
     return bytes(tsq.dump())
 
 def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
@@ -84,67 +84,92 @@ def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
 # --- ЛОГИКА MODE 53 (НАЛОЖЕНИЕ ШТАМПА) ---
 
 def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
+    """
+    Обработка режима 53: извлечение CMS, получение штампа времени и сборка ответа.
+    Штамп времени является ОБЯЗАТЕЛЬНЫМ.
+    """
     tsp_url = MANDATORY_TSP_URL if MANDATORY_TSP_URL else incoming_tsp_url
     
     if not tsp_url:
-        logger.error("ОШИБКА: TSP URL не задан.")
+        logger.error("КРИТИЧЕСКАЯ ОШИБКА: TSP URL не задан.")
         raise ValueError("TSP URL is missing")
 
+    # 1. Стерилизация и разделение данных
     try:
-        # Стерилизация входных данных
         curr_data = bytes(resp_body_bytes)
-        
-        # Разделение JSON и хвоста
         text_chunk = curr_data[:65536].decode('utf-8', errors='ignore')
+        
         start_json_idx = text_chunk.find('{')
         if start_json_idx == -1:
-             raise ValueError("Response is not a JSON")
+            raise ValueError("Ответ бэкенда не содержит JSON")
 
         decoder = json.JSONDecoder()
         data, end_idx_in_str = decoder.raw_decode(text_chunk[start_json_idx:])
         
+        # Находим точный байтовый офсет конца JSON
         json_only_str = text_chunk[:start_json_idx + end_idx_in_str]
         byte_offset = len(json_only_str.encode('utf-8'))
         
         header_bytes = curr_data[:byte_offset]
         binary_tail = curr_data[byte_offset:].strip(b'\r\n\x00 ')
         
+        logger.debug(f"Данные разделены. Заголовок: {byte_offset} байт, Хвост: {len(binary_tail)} байт")
     except Exception as e:
-        logger.error(f"Ошибка парсинга ответа бэкенда: {e}")
-        raise # ПРЕРЫВАЕМ выполнение
+        logger.error(f"Ошибка парсинга структуры ответа: {e}")
+        raise
 
-    # Определяем CMS
+    # 2. Поиск CMS подписи
     cms_b64 = data.get("Signature") or data.get("signature")
+    is_json_mode = False
+    
     if cms_b64:
         cms_der = bytes(base64.b64decode(cms_b64))
         is_json_mode = True
     elif len(binary_tail) > 100:
         cms_der = bytes(binary_tail)
         is_json_mode = False
+        logger.info("Подпись извлечена из бинарного хвоста.")
     else:
-        logger.error("Подпись отсутствует в ответе.")
-        raise ValueError("No signature found in backend response")
+        logger.error("Подпись не найдена ни в JSON, ни в хвосте.")
+        raise ValueError("Signature not found")
 
-    # РАБОТА СО ШТАМПОМ (БЕЗ FALLBACK)
+    # 3. Получение штампа времени (Строгий режим)
     try:
-        # 1. Извлекаем саму подпись для хеширования
+        # Извлекаем значение подписи (signature value) для хеширования
         sig_value_bytes = extract_signature_for_tsq(cms_der)
         
-        # 2. Формируем запрос
+        # Создаем запрос (TSQ)
         tsq_der = create_tsq(sig_value_bytes)
         
-        # 3. Запрос к TSP серверу
+        logger.info(f"Запрос штампа времени в TSP: {tsp_url}")
         ts_resp = requests.post(
             tsp_url, 
-            data=tsq_der, 
+            data=bytes(tsq_der), 
             headers={'Content-Type': 'application/timestamp-query'}, 
             timeout=15
         )
-        ts_resp.raise_for_status() 
+        ts_resp.raise_for_status()
         
-        # 4. Вшиваем штамп
-        updated_cms_der = inject_tsr_to_cms(cms_der, bytes(ts_resp.content))
-        logger.info("Штамп успешно получен и вшит в подпись.")
+        # ПАРСИНГ ОТВЕТА TSP
+        ts_resp_content = bytes(ts_resp.content)
+        tsp_response = tsp.TimeStampResp.load(ts_resp_content)
+        
+        status_info = tsp_response['status']
+        status = status_info['status'].native
+        
+        if status not in ['granted', 'granted_with_mods']:
+            # Извлекаем детальную ошибку от сервера
+            fail_info = status_info['fail_info'].native if status_info['fail_info'] else "no_details"
+            status_str = status_info['status_string'].native if status_info['status_string'] else "no_message"
+            logger.error(f"TSP сервер отказал в штампе! Статус: {status}, Ошибка: {fail_info}, Сообщение: {status_str}")
+            raise RuntimeError(f"TSP Server rejected request: {status} ({fail_info})")
+
+        # Если статус OK, берем токен (поле time_stamp_token теперь точно на месте)
+        ts_token = tsp_response['time_stamp_token']
+        
+        # 4. Вшиваем штамп в CMS
+        updated_cms_der = inject_tsr_to_cms(cms_der, ts_token.dump())
+        logger.info("Штамп времени успешно интегрирован в подпись.")
         
         # 5. Сборка финального ответа
         if is_json_mode:
@@ -152,13 +177,42 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
             data[field_name] = base64.b64encode(updated_cms_der).decode('ascii')
             return json.dumps(data, ensure_ascii=False).encode('utf-8')
         else:
+            # Возвращаем в исходном формате: JSON + Бинарный хвост
             return header_bytes + updated_cms_der
 
     except Exception as e:
-        logger.critical(f"ОБЯЗАТЕЛЬНЫЙ ШТАМП НЕ НАЛОЖЕН: {e}")
-        # Вместо возврата оригинальных байтов — кидаем ошибку выше
-        raise RuntimeError(f"Timestamp mandatory but failed: {e}")
+        logger.critical(f"НЕУДАЧА ПРИ НАЛОЖЕНИИ ОБЯЗАТЕЛЬНОГО ШТАМПА: {e}")
+        # Блокируем выдачу подписи без штампа
+        raise RuntimeError(f"Mandatory timestamp failed: {e}")
 
+# --- Обновленные вспомогательные функции для работы с ГОСТ ---
+
+def create_tsq(sig_bytes: bytes) -> bytes:
+    """Создает TimeStampReq. Используем SHA-256 как заглушку, 
+    но с OID ГОСТ 2012 для проверки реакции сервера."""
+    # В идеале здесь должен быть ГОСТ-хеш подписи
+    hash_value = hashlib.sha256(sig_bytes).digest() 
+    
+    message_imprint = tsp.MessageImprint({
+        'hash_algorithm': {
+            'algorithm': '1.2.643.7.1.1.2.2', # ГОСТ Р 34.11-2012 256 бит
+        },
+        'hashed_message': bytes(hash_value)
+    })
+    
+    tsq = tsp.TimeStampReq({
+        'version': 'v1',
+        'message_imprint': message_imprint,
+        'cert_req': True
+    })
+    return bytes(tsq.dump())
+
+def extract_signature_for_tsq(cms_der: bytes) -> bytes:
+    """Извлекает значение подписи из CMS."""
+    content_info = cms.ContentInfo.load(bytes(cms_der))
+    signed_data = content_info['content']
+    signer_info = signed_data['signer_infos'][0]
+    return bytes(signer_info['signature'].native)
 
 # --- ПОТОК И ЦИКЛ ---
 
