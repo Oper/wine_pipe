@@ -74,13 +74,8 @@ def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
 # --- ЛОГИКА MODE 53 (НАЛОЖЕНИЕ ШТАМПА) ---
 
 def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
-    """
-    Модифицирует ответ, добавляя штамп.
-    Игнорирует бинарные данные. Использует raw_decode для защиты от мусора.
-    """
     tsp_url = MANDATORY_TSP_URL if MANDATORY_TSP_URL else incoming_tsp_url
     
-    # 1. Проверяем, не бинарный ли это файл (PDF)
     if resp_body_bytes.startswith(b'%PDF') or b'xref' in resp_body_bytes:
         logger.warning("Бэкенд вернул PDF/бинарные данные. Пропускаем наложение штампа.")
         return resp_body_bytes
@@ -89,24 +84,25 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
         logger.error("БЛОКИРОВКА: Адрес TSP не задан, а он обязателен.")
         raise ValueError("TSP URL is missing")
 
-    # 2. Декодируем осторожно
     resp_text = resp_body_bytes.decode('utf-8', errors='ignore').lstrip()
     if not resp_text.startswith('{'):
         logger.warning("Ответ бэкенда не является JSON. Отдаем 'как есть'.")
         return resp_body_bytes
 
-    # 3. Парсим JSON с отсечением "Extra data"
     try:
         data, _ = json.JSONDecoder().raw_decode(resp_text)
     except Exception as e:
         logger.error(f"Не удалось извлечь JSON из ответа бэкенда: {e}")
         return resp_body_bytes
 
-    cms_b64 = data.get("Signature")
+    # Ищем Signature с большой и с маленькой буквы
+    cms_b64 = data.get("Signature") or data.get("signature")
+    
     if not cms_b64:
+        # ВОТ ЗДЕСЬ МЫ ВЫВОДИМ ОТВЕТ БЭКЕНДА В ЛОГ ДЛЯ ОТЛАДКИ
+        logger.error(f"Бэкенд не вернул подпись! Ответ бэкенда: {resp_text[:1000]}")
         raise ValueError("Backend returned no signature")
 
-    # 4. Криптографическая часть
     cms_der = base64.b64decode(cms_b64)
     sig_bytes = extract_signature_for_tsq(cms_der)
     tsq_der = create_tsq(sig_bytes)
@@ -120,8 +116,14 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     
     updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
     
-    data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+    # Сохраняем обратно в том же регистре, в котором нашли
+    if "Signature" in data:
+        data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+    else:
+        data["signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+        
     return json.dumps(data, ensure_ascii=False).encode('utf-8')
+
 
 # --- ПОТОК И ЦИКЛ ---
 
