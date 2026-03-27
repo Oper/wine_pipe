@@ -8,7 +8,7 @@ import base64
 import logging
 import traceback
 import threading
-import sys  # Добавлено для аргументов командной строки
+import sys
 from asn1crypto import cms, tsp, algos
 import gostcrypto
 
@@ -31,7 +31,7 @@ ch.setFormatter(formatter)
 logger.addHandler(fh)
 logger.addHandler(ch)
 
-# --- КРИПТОГРАФИЧЕСКИЕ ФУНКЦИИ (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- КРИПТОГРАФИЧЕСКИЕ ФУНКЦИИ ---
 
 def extract_signature_for_tsq(cms_der: bytes) -> bytes:
     content_info = cms.ContentInfo.load(cms_der)
@@ -41,10 +41,12 @@ def create_tsq(signature_bytes: bytes) -> bytes:
     hasher = gostcrypto.gosthash.new('streebog256')
     hasher.update(signature_bytes)
     hashed_value = hasher.digest()
+    
     message_imprint = tsp.MessageImprint({
         'hash_algorithm': algos.DigestAlgorithm({'algorithm': '1.2.643.7.1.1.2.2'}),
         'hashed_message': hashed_value
     })
+    
     return tsp.TimeStampReq({
         'version': 'v1',
         'message_imprint': message_imprint,
@@ -66,135 +68,127 @@ def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
     if first_signer['unsigned_attrs'].native is None:
         first_signer['unsigned_attrs'] = cms.CMSAttributes([])
     first_signer['unsigned_attrs'].append(ts_attribute)
+    
     return content_info.dump()
 
-# --- ИЗМЕНЕННАЯ ЛОГИКА ОБЯЗАТЕЛЬНОГО ШТАМПА ---
+# --- ЛОГИКА MODE 53 (НАЛОЖЕНИЕ ШТАМПА) ---
 
 def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     """
-    Модифицирует ответ, добавляя штамп. 
-    Безопасно проверяет, является ли ответ JSON-ом.
+    Модифицирует ответ, добавляя штамп.
+    Игнорирует бинарные данные. Использует raw_decode для защиты от мусора.
     """
     tsp_url = MANDATORY_TSP_URL if MANDATORY_TSP_URL else incoming_tsp_url
     
-    # 1. Проверяем, не бинарный ли это файл (PDF начинается с %PDF)
+    # 1. Проверяем, не бинарный ли это файл (PDF)
     if resp_body_bytes.startswith(b'%PDF') or b'xref' in resp_body_bytes:
         logger.warning("Бэкенд вернул PDF/бинарные данные. Пропускаем наложение штампа.")
         return resp_body_bytes
 
+    if not tsp_url:
+        logger.error("БЛОКИРОВКА: Адрес TSP не задан, а он обязателен.")
+        raise ValueError("TSP URL is missing")
+
+    # 2. Декодируем осторожно
+    resp_text = resp_body_bytes.decode('utf-8', errors='ignore').lstrip()
+    if not resp_text.startswith('{'):
+        logger.warning("Ответ бэкенда не является JSON. Отдаем 'как есть'.")
+        return resp_body_bytes
+
+    # 3. Парсим JSON с отсечением "Extra data"
     try:
-        # 2. Пытаемся декодировать осторожно
-        # Используем 'ignore', чтобы не падать на случайных байтах, 
-        # но для JSON нам нужна чистая строка
-        resp_text = resp_body_bytes.decode('utf-8', errors='ignore').strip('\x00 ')
-        
-        # Если это не похоже на JSON (нет фигурной скобки), отдаем как есть
-        if not resp_text.startswith('{'):
-            logger.warning("Ответ бэкенда не является JSON. Отдаем 'как есть'.")
-            return resp_body_bytes
-
-        data = json.loads(resp_text)
-        cms_b64 = data.get("Signature")
-        
-        if not cms_b64:
-            logger.info("В JSON нет поля Signature, наложение штампа пропущено.")
-            return resp_body_bytes
-
-        # --- Далее логика наложения штампа (сокращено для краткости) ---
-        cms_der = base64.b64decode(cms_b64)
-        sig_bytes = extract_signature_for_tsq(cms_der)
-        tsq_der = create_tsq(sig_bytes)
-        
-        logger.info(f"Запрос штампа: {tsp_url}")
-        ts_resp = requests.post(tsp_url, data=tsq_der, 
-                                headers={'Content-Type': 'application/timestamp-query'}, 
-                                timeout=10)
-        ts_resp.raise_for_status()
-        
-        updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
-        data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
-        
-        return json.dumps(data, ensure_ascii=False).encode('utf-8')
-
+        data, _ = json.JSONDecoder().raw_decode(resp_text)
     except Exception as e:
-        # Если мы УВЕРЕНЫ, что это должен был быть JSON Mode 53, но штамп не поставился
-        # — тогда блокируем (как мы договорились ранее)
-        logger.error(f"КРИТИЧЕСКАЯ ОШИБКА в Mode 53: {e}")
-        raise # Пробрасываем ошибку выше, чтобы handle_client отправил 500
+        logger.error(f"Не удалось извлечь JSON из ответа бэкенда: {e}")
+        return resp_body_bytes
+
+    cms_b64 = data.get("Signature")
+    if not cms_b64:
+        raise ValueError("Backend returned no signature")
+
+    # 4. Криптографическая часть
+    cms_der = base64.b64decode(cms_b64)
+    sig_bytes = extract_signature_for_tsq(cms_der)
+    tsq_der = create_tsq(sig_bytes)
+    
+    logger.info(f"Запрос обязательного штампа: {tsp_url}")
+    
+    ts_resp = requests.post(tsp_url, data=tsq_der, 
+                            headers={'Content-Type': 'application/timestamp-query'}, 
+                            timeout=10)
+    ts_resp.raise_for_status() 
+    
+    updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
+    
+    data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+    return json.dumps(data, ensure_ascii=False).encode('utf-8')
 
 # --- ПОТОК И ЦИКЛ ---
 
 def handle_client(hPipe):
     """
-    Финальная версия: Многопоточная обработка, очистка JSON, 
-    детектор бинарных данных и блокировка подписи без штампа.
+    Обработка клиента. Сверхпрочная очистка JSON и детектор бинарных данных.
     """
     try:
-        # 1. Читаем заголовок из Pipe
+        # Читаем заголовки
         hr, raw_headers = win32file.ReadFile(hPipe, 65536)
         headers_str = raw_headers.decode('utf-8', errors='ignore')
         
-        # Находим длину тела запроса
         cl = 0
         for line in headers_str.split('\r\n'):
             if line.lower().startswith("content-length:"):
                 cl = int(line.split(':')[1].strip())
         
-        # 2. Читаем тело запроса целиком
+        # Читаем тело
         body_bytes = b""
         if cl > 0:
             while len(body_bytes) < cl:
                 hr, chunk = win32file.ReadFile(hPipe, min(65536, cl - len(body_bytes)))
                 body_bytes += chunk
         
-        # 3. МАКСИМАЛЬНАЯ ОЧИСТКА И АНАЛИЗ ВХОДА
-        # Убираем нулевые байты и мусор, которые Wine/C++ могут подкинуть в Pipe
+        # Очистка входа от нулевых байтов и мусора
         clean_input = body_bytes.replace(b'\x00', b'').replace(b'\xef\xbb\xbf', b'').strip()
         
         mode = 0
         tsp_url = ""
         
-        # Проверяем, не PDF ли это на входе
+        # Анализ запроса
         if clean_input.startswith(b'%PDF'):
-            logger.info("На входе PDF/Бинарные данные. Пропускаем парсинг JSON.")
+            logger.info("На входе PDF. Пропускаем парсинг JSON.")
         else:
             try:
-                body_str = clean_input.decode('utf-8', errors='ignore')
+                body_str = clean_input.decode('utf-8', errors='ignore').lstrip()
                 if body_str.startswith('{'):
-                    payload = json.loads(body_str)
+                    # raw_decode игнорирует любой мусор после закрывающей скобки }
+                    payload, _ = json.JSONDecoder().raw_decode(body_str)
                     mode = payload.get("mode", 0)
                     tsp_url = payload.get("TSP_URL", "")
-                    logger.debug(f"JSON распаршен. Mode: {mode}")
+                    logger.debug(f"JSON распаршен чисто (мусор отсечен). Mode: {mode}")
             except Exception as je:
                 logger.warning(f"Не удалось распарсить тело как JSON: {je}")
-                # Аварийная проверка на случай битого JSON для Mode 53
                 if b'"mode":53' in clean_input or b'"mode": 53' in clean_input:
                     mode = 53
-                    logger.warning("Сработала аварийная защита: обнаружен Mode 53 в 'грязных' данных.")
+                    logger.warning("Сработала аварийная защита: обнаружен Mode 53.")
 
-        # 4. ЗАПРОС НА БЭКЕНД
+        # Проксирование на бэкенд
         logger.debug(f"Проксирование запроса (Mode {mode}) на бэкенд...")
         req_headers = {
             'Accept': 'application/json, text/javascript, */*; q=0.01',
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
         }
         
-        # Отправляем оригинальные байты (body_bytes) на бэкенд
         resp = requests.post(BACKEND_URL, data=body_bytes, headers=req_headers, timeout=25)
         resp_content = resp.content
 
-        # 5. ОБРАБОТКА И НАЛОЖЕНИЕ ШТАМПА (MODE 53)
+        # Обработка Mode 53
         try:
             if mode == 53:
-                # Внутри process_mode_53 теперь встроена проверка на PDF и ошибки
                 resp_content = process_mode_53(resp_content, tsp_url)
             
-            # Если всё прошло успешно (или это не 53 мод), формируем 200 OK
             status_line = "HTTP/1.1 200 OK"
             logger.info(f"Запрос Mode {mode} обработан успешно.")
 
         except Exception as e:
-            # Если наложение штампа сорвалось — БЛОКИРУЕМ ПОДПИСЬ
             logger.error(f"ОТКАЗ В ПОДПИСИ (Mode {mode}): {e}")
             resp_content = json.dumps({
                 "success": False, 
@@ -203,7 +197,7 @@ def handle_client(hPipe):
             }).encode('utf-8')
             status_line = "HTTP/1.1 500 Internal Server Error"
 
-        # 6. ФОРМИРУЕМ ФИНАЛЬНЫЙ HTTP ОТВЕТ
+        # Формирование ответа
         http_response = (
             f"{status_line}\r\n"
             f"Content-Type: application/json; charset=utf-8\r\n"
@@ -211,7 +205,6 @@ def handle_client(hPipe):
             f"Connection: close\r\n\r\n"
         ).encode('ascii') + resp_content
 
-        # 7. ОТПРАВЛЯЕМ В PIPE КЛИЕНТУ
         win32file.WriteFile(hPipe, http_response)
 
     except pywintypes.error as e:
@@ -220,7 +213,6 @@ def handle_client(hPipe):
         logger.error(f"Критический сбой в потоке: {e}")
         logger.error(traceback.format_exc())
     finally:
-        # Всегда закрываем соединение
         try:
             win32file.FlushFileBuffers(hPipe)
             win32pipe.DisconnectNamedPipe(hPipe)
@@ -228,26 +220,42 @@ def handle_client(hPipe):
         except:
             pass
 
-
 def main():
     global MANDATORY_TSP_URL
-    # Проверка аргументов командной строки
     if len(sys.argv) > 1:
         MANDATORY_TSP_URL = sys.argv[1]
-        logger.info(f"Программа запущена с ПРИНУДИТЕЛЬНЫМ адресом штампа: {MANDATORY_TSP_URL}")
+        logger.info(f"ПРИНУДИТЕЛЬНЫЙ адрес штампа времени: {MANDATORY_TSP_URL}")
     else:
-        logger.warning("Параметр штампа не задан. Будет использован TSP_URL из запроса клиента.")
+        logger.warning("Параметр штампа не задан. Будет использован TSP_URL из запроса.")
 
-    logger.info("=== Start Multi-threaded Proxy with Mandatory TSP ===")
+    logger.info("=== Start Multi-threaded Proxy with Clean JSON ===")
+    
     while True:
+        hPipe = None
         try:
-            hPipe = win32pipe.CreateNamedPipe(PIPE_NAME, win32pipe.PIPE_ACCESS_DUPLEX, 
+            hPipe = win32pipe.CreateNamedPipe(
+                PIPE_NAME,
+                win32pipe.PIPE_ACCESS_DUPLEX,
                 win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-                win32pipe.PIPE_UNLIMITED_INSTANCES, 65536, 65536, 0, None)
+                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                65536, 65536, 0, None
+            )
+            
             win32pipe.ConnectNamedPipe(hPipe, None)
-            threading.Thread(target=handle_client, args=(hPipe,), daemon=True).start()
+            
+            client_thread = threading.Thread(target=handle_client, args=(hPipe,))
+            client_thread.daemon = True
+            client_thread.start()
+
+        except pywintypes.error as e:
+            logger.error(f"Системная ошибка Pipe: {e}")
+            if hPipe:
+                win32file.CloseHandle(hPipe)
         except Exception as e:
-            logger.error(f"Main loop error: {e}")
+            logger.error(f"Непредвиденная ошибка: {e}")
+            if hPipe:
+                try: win32file.CloseHandle(hPipe)
+                except: pass
 
 if __name__ == "__main__":
     main()
