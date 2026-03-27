@@ -81,8 +81,9 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
         raise ValueError("TSP URL is missing")
 
     try:
-        # 1. Декодируем только начало (достаточно для любого JSON-заголовка)
-        # Берем первые 64КБ, чтобы не пытаться декодировать весь бинарный хвост
+        # Убеждаемся, что работаем с bytes
+        resp_body_bytes = bytes(resp_body_bytes)
+        
         text_chunk = resp_body_bytes[:65536].decode('utf-8', errors='ignore')
         start_json_idx = text_chunk.find('{')
         if start_json_idx == -1:
@@ -91,22 +92,16 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
         decoder = json.JSONDecoder()
         data, end_idx_in_str = decoder.raw_decode(text_chunk[start_json_idx:])
         
-        # 2. ВАЖНО: Находим точный БАЙТОВЫЙ индекс конца JSON
-        # Берем подстроку, которая является чистым JSON, и считаем её байты в UTF-8
         json_only_str = text_chunk[:start_json_idx + end_idx_in_str]
         byte_offset = len(json_only_str.encode('utf-8'))
         
-        # Оригинальный заголовок (все байты до конца JSON)
         header_bytes = resp_body_bytes[:byte_offset]
-        # Хвост — всё, что после
         binary_tail = resp_body_bytes[byte_offset:].strip(b'\r\n\x00 ')
         
-        logger.debug(f"JSON отделен. Байт в заголовке: {byte_offset}, Длина хвоста: {len(binary_tail)}")
     except Exception as e:
         logger.error(f"Ошибка разделения данных: {e}")
         return resp_body_bytes
 
-    # 3. Определяем, где подпись
     cms_b64 = data.get("Signature") or data.get("signature")
     is_json_mode = False
     
@@ -114,42 +109,36 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
         cms_der = base64.b64decode(cms_b64)
         is_json_mode = True
     elif len(binary_tail) > 100:
-        cms_der = binary_tail
-        # На всякий случай: если хвост выглядит как Base64 (текстовый), декодируем его
-        if binary_tail[:1] in b'MI': # CMS в DER обычно начинается с 'MII...' в Base64 или 0x30 в бинарнике
-             try:
-                 # Проверка: если это валидный Base64
-                 cms_der = base64.b64decode(binary_tail, validate=True)
-                 logger.info("Хвост был в Base64, успешно декодирован.")
-             except:
-                 pass # Значит это чистый DER бинарник
+        cms_der = bytes(binary_tail) # <--- ФИКС: Принудительно в bytes
         logger.info("Подпись взята из бинарного хвоста.")
     else:
         logger.error("Подпись не найдена.")
         return resp_body_bytes
 
-    # 4. Наложение штампа (стандартный блок)
     try:
-        sig_bytes = extract_signature_for_tsq(cms_der)
-        tsq_der = create_tsq(sig_bytes)
+        # Внутри этих функций тоже добавим страховку
+        sig_bytes = bytes(extract_signature_for_tsq(cms_der)) 
+        tsq_der = bytes(create_tsq(sig_bytes))
         
+        logger.info(f"Запрос штампа: {tsp_url}")
         ts_resp = requests.post(tsp_url, data=tsq_der, 
                                 headers={'Content-Type': 'application/timestamp-query'}, 
                                 timeout=10)
         ts_resp.raise_for_status() 
         
-        updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
+        updated_cms_der = inject_tsr_to_cms(cms_der, bytes(ts_resp.content))
         
         if is_json_mode:
             field_name = "Signature" if "Signature" in data else "signature"
             data[field_name] = base64.b64encode(updated_cms_der).decode('ascii')
             return json.dumps(data, ensure_ascii=False).encode('utf-8')
         else:
-            # Возвращаем «как было»: оригинальный заголовок + новая бинарная подпись
-            logger.info("Сборка ответа: оригинальный JSON + обновленный бинарный хвост.")
+            logger.info("Штамп успешно вшит в бинарный хвост.")
             return header_bytes + updated_cms_der
 
     except Exception as e:
+        # Если штамп не удался, мы возвращаем оригинальные данные, 
+        # чтобы не ломать основную работу программы (что и произошло в вашем логе)
         logger.error(f"Ошибка штампа: {e}")
         return resp_body_bytes
 
