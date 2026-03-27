@@ -76,57 +76,70 @@ def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
 def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     tsp_url = MANDATORY_TSP_URL if MANDATORY_TSP_URL else incoming_tsp_url
     
-    if resp_body_bytes.startswith(b'%PDF') or b'xref' in resp_body_bytes:
-        logger.warning("Бэкенд вернул PDF/бинарные данные. Пропускаем наложение штампа.")
-        return resp_body_bytes
-
     if not tsp_url:
-        logger.error("БЛОКИРОВКА: Адрес TSP не задан, а он обязателен.")
+        logger.error("БЛОКИРОВКА: Адрес TSP не задан.")
         raise ValueError("TSP URL is missing")
 
-    resp_text = resp_body_bytes.decode('utf-8', errors='ignore').lstrip()
-    if not resp_text.startswith('{'):
-        logger.warning("Ответ бэкенда не является JSON. Отдаем 'как есть'.")
-        return resp_body_bytes
-
+    # 1. Отделяем JSON от "хвоста" (бинарных данных)
+    # Находим индекс первой закрывающей фигурной скобки, за которой нет данных JSON
     try:
-        data, _ = json.JSONDecoder().raw_decode(resp_text)
+        resp_text = resp_body_bytes.decode('utf-8', errors='ignore')
+        decoder = json.JSONDecoder()
+        data, index = decoder.raw_decode(resp_text.lstrip())
+        
+        # Индекс начала "хвоста" в байтах
+        # (учитываем возможные пробелы в начале, lstrip)
+        start_offset = resp_body_bytes.find(b'{') + index
+        binary_tail = resp_body_bytes[start_offset:].strip(b'\r\n\x00 ')
+        
+        logger.debug(f"JSON распаршен. Длина хвоста: {len(binary_tail)} байт.")
     except Exception as e:
-        logger.error(f"Не удалось извлечь JSON из ответа бэкенда: {e}")
+        logger.error(f"Ошибка разделения JSON и бинарных данных: {e}")
         return resp_body_bytes
 
-    # Ищем Signature с большой и с маленькой буквы
+    # 2. Пытаемся понять, где подпись
+    # Если в JSON нет поля Signature, значит подпись — это и есть binary_tail
     cms_b64 = data.get("Signature") or data.get("signature")
     
-    if not cms_b64:
-        # Сохраняем ВЕСЬ ответ бэкенда в файл для анализа
-        with open("debug_mode53.json", "w", encoding="utf-8") as f:
-            f.write(resp_text)
-            
-        logger.error("Подпись не найдена в корне JSON! Полный ответ сохранен в файл debug_mode53.json")
-        raise ValueError("Backend returned no signature")
-
-
-    cms_der = base64.b64decode(cms_b64)
-    sig_bytes = extract_signature_for_tsq(cms_der)
-    tsq_der = create_tsq(sig_bytes)
-    
-    logger.info(f"Запрос обязательного штампа: {tsp_url}")
-    
-    ts_resp = requests.post(tsp_url, data=tsq_der, 
-                            headers={'Content-Type': 'application/timestamp-query'}, 
-                            timeout=10)
-    ts_resp.raise_for_status() 
-    
-    updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
-    
-    # Сохраняем обратно в том же регистре, в котором нашли
-    if "Signature" in data:
-        data["Signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+    if cms_b64:
+        cms_der = base64.b64decode(cms_b64)
+        is_json_mode = True
+    elif len(binary_tail) > 100: # Если хвост достаточно большой, считаем его подписью
+        cms_der = binary_tail
+        is_json_mode = False
+        logger.info("Подпись взята из бинарного хвоста ответа.")
     else:
-        data["signature"] = base64.b64encode(updated_cms_der).decode('ascii')
+        logger.error("Подпись не найдена ни в JSON, ни в хвосте.")
+        return resp_body_bytes
+
+    # 3. Накладываем штамп
+    try:
+        sig_bytes = extract_signature_for_tsq(cms_der)
+        tsq_der = create_tsq(sig_bytes)
         
-    return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        ts_resp = requests.post(tsp_url, data=tsq_der, 
+                                headers={'Content-Type': 'application/timestamp-query'}, 
+                                timeout=10)
+        ts_resp.raise_for_status() 
+        
+        updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
+        logger.info("Штамп времени успешно вшит в CMS.")
+        
+        # 4. Собираем ответ обратно
+        if is_json_mode:
+            # Если подпись была внутри JSON
+            field_name = "Signature" if "Signature" in data else "signature"
+            data[field_name] = base64.b64encode(updated_cms_der).decode('ascii')
+            return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        else:
+            # Если подпись шла хвостом (как в твоем случае)
+            # Возвращаем JSON + обновленный бинарный хвост
+            header_json = json.dumps(data, ensure_ascii=False).encode('utf-8')
+            return header_json + b'\r\n' + updated_cms_der
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка при наложении штампа: {e}")
+        raise
 
 
 # --- ПОТОК И ЦИКЛ ---
