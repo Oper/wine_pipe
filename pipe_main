@@ -99,9 +99,13 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     cms_b64 = data.get("Signature") or data.get("signature")
     
     if not cms_b64:
-        # ВОТ ЗДЕСЬ МЫ ВЫВОДИМ ОТВЕТ БЭКЕНДА В ЛОГ ДЛЯ ОТЛАДКИ
-        logger.error(f"Бэкенд не вернул подпись! Ответ бэкенда: {resp_text[:1000]}")
+        # Сохраняем ВЕСЬ ответ бэкенда в файл для анализа
+        with open("debug_mode53.json", "w", encoding="utf-8") as f:
+            f.write(resp_text)
+            
+        logger.error("Подпись не найдена в корне JSON! Полный ответ сохранен в файл debug_mode53.json")
         raise ValueError("Backend returned no signature")
+
 
     cms_der = base64.b64decode(cms_b64)
     sig_bytes = extract_signature_for_tsq(cms_der)
