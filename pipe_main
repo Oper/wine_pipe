@@ -33,7 +33,6 @@ logger.addHandler(ch)
 # --- КРИПТОГРАФИЧЕСКИЕ ФУНКЦИИ (ГОСТ 2012) ---
 
 def extract_signature_for_tsq(cms_der: bytes) -> bytes:
-    """Извлекает значение подписи для хеширования."""
     content_info = cms.ContentInfo.load(bytes(cms_der))
     if content_info['content_type'].native != 'signed_data':
         raise ValueError("CMS is not SignedData")
@@ -42,8 +41,6 @@ def extract_signature_for_tsq(cms_der: bytes) -> bytes:
     return bytes(signer_info['signature'].native)
 
 def create_tsq(sig_bytes: bytes) -> bytes:
-    """Создает запрос штампа с реальным ГОСТ-хешем."""
-    # ВАЖНО: Используем Стрибог-256 (ГОСТ Р 34.11-2012)
     hasher = gostcrypto.gosthash.new('streebog256', data=sig_bytes)
     hash_value = hasher.digest()
     
@@ -51,7 +48,7 @@ def create_tsq(sig_bytes: bytes) -> bytes:
 
     message_imprint = tsp.MessageImprint({
         'hash_algorithm': {
-            'algorithm': '1.2.643.7.1.1.2.2', # ГОСТ Р 34.11-2012 256 бит
+            'algorithm': '1.2.643.7.1.1.2.2', 
         },
         'hashed_message': bytes(hash_value)
     })
@@ -64,11 +61,9 @@ def create_tsq(sig_bytes: bytes) -> bytes:
     return bytes(tsq.dump())
 
 def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
-    """Вшивает штамп времени в неподписанные атрибуты CMS."""
     content_info = cms.ContentInfo.load(bytes(cms_der))
     signer_info = content_info['content']['signer_infos'][0]
     
-    # Парсим ответ TSP и проверяем статус
     ts_resp = tsp.TimeStampResp.load(bytes(tsr_der))
     status = ts_resp['status']['status'].native
     if status not in ('granted', 'granted_with_mods'):
@@ -77,13 +72,11 @@ def inject_tsr_to_cms(cms_der: bytes, tsr_der: bytes) -> bytes:
         
     ts_token = ts_resp['time_stamp_token']
     
-    # OID для signature-time-stamp: 1.2.840.113549.1.9.16.2.14
     ts_attribute = cms.CMSAttribute({
         'type': '1.2.840.113549.1.9.16.2.14',
         'values': [ts_token]
     })
     
-    # Инициализация атрибутов, если их нет
     if isinstance(signer_info['unsigned_attrs'], core.Void):
         signer_info['unsigned_attrs'] = cms.CMSAttributes([])
     
@@ -97,7 +90,6 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     if not tsp_url:
         raise ValueError("TSP URL is missing")
 
-    # 1. Разделение JSON и бинарного хвоста
     curr_data = bytes(resp_body_bytes)
     text_chunk = curr_data[:65536].decode('utf-8', errors='ignore')
     start_json_idx = text_chunk.find('{')
@@ -109,10 +101,11 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     
     json_only_str = text_chunk[:start_json_idx + end_idx_in_str]
     byte_offset = len(json_only_str.encode('utf-8'))
+    
     header_bytes = curr_data[:byte_offset]
-    binary_tail = curr_data[byte_offset:].strip(b'\r\n\x00 ')
+    remainder = curr_data[byte_offset:]
+    binary_tail = remainder.strip(b'\r\n\x00 ')
 
-    # 2. Поиск CMS
     cms_b64 = data.get("Signature") or data.get("signature")
     is_json_mode = False
     
@@ -125,11 +118,10 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     else:
         raise ValueError("Signature not found in response")
 
-    # 3. Штамп времени
+    # Получение штампа
     sig_val = extract_signature_for_tsq(cms_der)
     tsq_der = create_tsq(sig_val)
     
-    logger.info(f"Запрос штампа (Mode 53) -> {tsp_url}")
     ts_resp = requests.post(
         tsp_url, 
         data=tsq_der, 
@@ -139,21 +131,25 @@ def process_mode_53(resp_body_bytes: bytes, incoming_tsp_url: str) -> bytes:
     ts_resp.raise_for_status()
     
     updated_cms_der = inject_tsr_to_cms(cms_der, ts_resp.content)
-    logger.info("Штамп успешно интегрирован.")
-
-    # 4. Сборка обратно
+    
+    # Сборка ответа
     if is_json_mode:
         field_name = "Signature" if "Signature" in data else "signature"
         data[field_name] = base64.b64encode(updated_cms_der).decode('ascii')
-        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        return json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     else:
-        return header_bytes + updated_cms_der
+        idx = remainder.find(binary_tail)
+        if idx != -1:
+            gap = remainder[:idx]
+            trailing_gap = remainder[idx + len(binary_tail):]
+            return header_bytes + gap + updated_cms_der + trailing_gap
+        else:
+            return header_bytes + b'\r\n' + updated_cms_der
 
 # --- ЛОГИКА ТРУБЫ (PIPE) ---
 
 def handle_client(hPipe):
     try:
-        # Чтение запроса
         hr, raw_headers = win32file.ReadFile(hPipe, 65536)
         headers_str = raw_headers.decode('utf-8', errors='ignore')
         
@@ -169,27 +165,26 @@ def handle_client(hPipe):
                 body_bytes += chunk
         
         clean_input = body_bytes.replace(b'\x00', b'').strip()
-        
         mode = 0
         tsp_url = ""
         
-        # Парсинг Mode
         try:
             body_str = clean_input.decode('utf-8', errors='ignore').lstrip()
             if body_str.startswith('{'):
                 payload, _ = json.JSONDecoder().raw_decode(body_str)
                 mode = payload.get("mode", 0)
-                tsp_url = payload.get("TSP_URL", "")
+                # Получаем адрес сервера штампа из запроса СДП,если его нет используем по умолчанию.
+                tsp_url = payload.get("TSP_URL", "http://127.0.0.1:87/tsp/tsp.srf")
         except:
             if b'"mode":53' in clean_input or b'"mode": 53' in clean_input:
                 mode = 53
 
-        # Проксирование
         req_headers = {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}
         resp = requests.post(BACKEND_URL, data=body_bytes, headers=req_headers, timeout=25)
         resp_content = resp.content
+        
+        original_content_type = resp.headers.get('Content-Type', 'application/json; charset=utf-8')
 
-        # Обработка Mode 53
         status_line = "HTTP/1.1 200 OK"
         if mode == 53:
             try:
@@ -203,11 +198,11 @@ def handle_client(hPipe):
                     "details": str(e)
                 }).encode('utf-8')
                 status_line = "HTTP/1.1 500 Internal Server Error"
+                original_content_type = "application/json; charset=utf-8"
 
-        # Ответ клиенту
         http_response = (
             f"{status_line}\r\n"
-            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Type: {original_content_type}\r\n"
             f"Content-Length: {len(resp_content)}\r\n"
             f"Connection: close\r\n\r\n"
         ).encode('ascii') + resp_content
