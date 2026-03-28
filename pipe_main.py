@@ -227,7 +227,7 @@ def handle_client(hPipe):
         status_line = "HTTP/1.1 200 OK"
         if mode == 53:
             try:
-                resp_content = process_mode_53(resp_content, tsp_url)
+                resp_content = process_mode_53(resp_content, tsp_url, req_id)
                 logger.info("Запрос Mode 53 успешно завершен со штампом.")
             except Exception as e:
                 logger.error(f"ОТКАЗ В ШТАМПЕ: {e}")
